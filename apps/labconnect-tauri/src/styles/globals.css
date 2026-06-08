@@ -1,0 +1,263 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #F7F8FA;
+  --surface: #FFFFFF;
+  --surface-soft: #F9FAFB;
+  --surface-hover: #F3F6FB;
+  --border: #E5E7EB;
+  --border-strong: #CBD5E1;
+  --text-primary: #0F172A;
+  --text-secondary: #475569;
+  --text-muted: #64748B;
+  --text-disabled: #94A3B8;
+  --brand: #2563EB;
+  --brand-hover: #1D4ED8;
+  --brand-soft: #EFF6FF;
+  --brand-border: #BFDBFE;
+  --success: #16A34A;
+  --success-soft: #ECFDF3;
+  --warning: #F59E0B;
+  --warning-soft: #FFFBEB;
+  --danger: #DC2626;
+  --danger-soft: #FEF2F2;
+  --info: #06B6D4;
+  --info-soft: #ECFEFF;
+  --ease-out-strong: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out-strong: cubic-bezier(0.77, 0, 0.175, 1);
+  color: var(--text-primary);
+  background: var(--background);
+  font-family: "Geist", "Inter", "SF Pro Display", "Segoe UI", Arial, sans-serif;
+  font-synthesis: none;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+}
+
+.dark {
+  --background: #08111F;
+  --surface: #101827;
+  --surface-soft: #111F33;
+  --surface-hover: #182842;
+  --border: #243247;
+  --border-strong: #334155;
+  --text-primary: #F8FAFC;
+  --text-secondary: #CBD5E1;
+  --text-muted: #94A3B8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button, input, select, textarea {
+  font: inherit;
+}
+
+.animate-lab-enter {
+  animation: lab-enter 260ms var(--ease-out-strong) both;
+}
+
+.animate-lab-screen {
+  animation: lab-screen 300ms var(--ease-out-strong) both;
+}
+
+.animate-lab-panel {
+  animation: lab-panel 360ms var(--ease-out-strong) both;
+}
+
+.animate-lab-logo {
+  animation: lab-logo 620ms var(--ease-out-strong) both;
+}
+
+.animate-lab-fade-up {
+  animation: lab-fade-up 320ms var(--ease-out-strong) both;
+}
+
+.animate-lab-fade-down {
+  animation: lab-fade-down 280ms var(--ease-out-strong) both;
+}
+
+.animate-lab-device-card {
+  animation: lab-device-card 440ms var(--ease-out-strong) 90ms both;
+}
+
+.animate-lab-success {
+  animation: lab-success 520ms var(--ease-out-strong) both;
+}
+
+.animate-lab-ping {
+  animation: lab-ping 1800ms var(--ease-out-strong) infinite;
+}
+
+.animate-lab-pulse {
+  animation: lab-pulse 1200ms ease-in-out infinite;
+}
+
+.animate-lab-scan {
+  animation: lab-scan 1600ms linear infinite;
+}
+
+.animate-lab-breathe {
+  animation: lab-breathe 2200ms ease-in-out infinite;
+}
+
+@keyframes lab-screen {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes lab-panel {
+  from {
+    opacity: 0;
+    transform: translateY(18px) scale(0.965);
+    filter: blur(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0);
+  }
+}
+
+@keyframes lab-logo {
+  0% {
+    opacity: 0;
+    transform: translateY(16px) scale(0.92);
+  }
+  58% {
+    opacity: 1;
+    transform: translateY(-2px) scale(1.025);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes lab-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes lab-fade-down {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes lab-device-card {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes lab-success {
+  0% {
+    opacity: 0;
+    transform: scale(0.86);
+  }
+  55% {
+    opacity: 1;
+    transform: scale(1.045);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes lab-enter {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes lab-ping {
+  0% {
+    opacity: 0.72;
+    transform: scale(0.72);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.18);
+  }
+}
+
+@keyframes lab-breathe {
+  0%, 100% {
+    opacity: 0.45;
+    transform: scale(0.92);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.08);
+  }
+}
+
+@keyframes lab-pulse {
+  0%, 100% {
+    transform: scale(0.96);
+    opacity: 0.65;
+  }
+  50% {
+    transform: scale(1.04);
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 1ms !important;
+  }
+}
+
+@keyframes lab-scan {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 430px) {
+  :root {
+    --labconnect-printer-control-height: 52px;
+  }
+}

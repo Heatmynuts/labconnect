@@ -1,0 +1,10 @@
+{
+  "name": "@labconnect/design-system",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./tailwind-preset": "./tailwind-preset.ts"
+  }
+}

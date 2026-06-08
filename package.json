@@ -1,0 +1,26 @@
+{
+  "name": "labconnect",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @labconnect/app",
+    "build": "npm run build -w @labconnect/app",
+    "typecheck": "npm run typecheck -w @labconnect/app",
+    "tauri": "npm run tauri -w @labconnect/app"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.16",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.0.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.8.3",
+    "vite": "^6.0.7"
+  }
+}

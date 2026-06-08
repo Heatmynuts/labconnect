@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.DS_Store
+*.tsbuildinfo
+
+apps/*/dist/
+apps/*/src-tauri/target/
+apps/*/src-tauri/gen/android/.gradle/
+apps/*/src-tauri/gen/android/build/
+apps/*/src-tauri/gen/android/app/build/
+apps/*/src-tauri/gen/android/buildSrc/.gradle/
+
+.env
+.env.*
+!.env.example
