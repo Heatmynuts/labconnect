@@ -74,6 +74,7 @@ export type TicketField =
   | "unit"
   | "lotNumber"
   | "sampleId"
+  | "comment"
   | "methodName"
   | "dryingTemperature"
   | "dryingTime"
@@ -126,6 +127,7 @@ export type WeighingRecord = {
   unit: string;
   lotNumber: string;
   sampleId: string;
+  comment?: string;
   signature?: string;
   grossWeight?: string;
   tareWeight?: string;
@@ -147,6 +149,7 @@ export type LabConnectTicketQr = {
   op: string;
   lot: string;
   sample: string;
+  comment?: string;
   balance: string;
   raw: string;
   weight: string;
@@ -166,6 +169,7 @@ export function buildTicketQrPayload(record: WeighingRecord) {
     op: record.operator,
     lot: record.lotNumber,
     sample: record.sampleId,
+    comment: record.comment,
     balance: record.balanceName,
     raw: record.rawBalanceLine,
     weight: record.weight,
@@ -193,6 +197,7 @@ export function parseTicketQrPayload(value: string): LabConnectTicketQr | null {
       op: String(payload.op ?? ""),
       lot: String(payload.lot ?? ""),
       sample: String(payload.sample ?? ""),
+      comment: payload.comment ? String(payload.comment) : undefined,
       balance: String(payload.balance ?? ""),
       raw: String(payload.raw ?? ""),
       weight: String(payload.weight ?? payload.raw ?? ""),
@@ -217,6 +222,7 @@ export function ticketQrToRecord(ticket: LabConnectTicketQr): WeighingRecord {
     unit: ticket.unit ?? "g",
     lotNumber: ticket.lot,
     sampleId: ticket.sample,
+    comment: ticket.comment,
     grossWeight: ticket.gross,
     tareWeight: ticket.tare,
     netWeight: ticket.net

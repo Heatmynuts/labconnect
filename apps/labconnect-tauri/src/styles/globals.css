@@ -3,28 +3,28 @@
 @tailwind utilities;
 
 :root {
-  --background: #F7F8FA;
+  --background: #F3F8F5;
   --surface: #FFFFFF;
-  --surface-soft: #F9FAFB;
-  --surface-hover: #F3F6FB;
-  --border: #E5E7EB;
-  --border-strong: #CBD5E1;
-  --text-primary: #0F172A;
-  --text-secondary: #475569;
-  --text-muted: #64748B;
+  --surface-soft: #ECF6F0;
+  --surface-hover: #E2F0EA;
+  --border: #D8E5DF;
+  --border-strong: #AAC5BD;
+  --text-primary: #07111F;
+  --text-secondary: #34485D;
+  --text-muted: #607287;
   --text-disabled: #94A3B8;
-  --brand: #2563EB;
-  --brand-hover: #1D4ED8;
-  --brand-soft: #EFF6FF;
-  --brand-border: #BFDBFE;
-  --success: #16A34A;
-  --success-soft: #ECFDF3;
-  --warning: #F59E0B;
-  --warning-soft: #FFFBEB;
+  --brand: #4338F2;
+  --brand-hover: #3329CF;
+  --brand-soft: #E9E7FF;
+  --brand-border: #C8C2FF;
+  --success: #0F9F6E;
+  --success-soft: #DDF6EA;
+  --warning: #C99324;
+  --warning-soft: #FFF5D8;
   --danger: #DC2626;
   --danger-soft: #FEF2F2;
-  --info: #06B6D4;
-  --info-soft: #ECFEFF;
+  --info: #41C7D7;
+  --info-soft: #DDF8F9;
   --ease-out-strong: cubic-bezier(0.23, 1, 0.32, 1);
   --ease-in-out-strong: cubic-bezier(0.77, 0, 0.175, 1);
   color: var(--text-primary);
@@ -55,6 +55,10 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  background:
+    radial-gradient(circle at 16% 22%, rgba(203, 220, 151, 0.58), transparent 30rem),
+    radial-gradient(circle at 82% 8%, rgba(148, 205, 199, 0.58), transparent 36rem),
+    linear-gradient(135deg, #f6f7ef 0%, #edf7f2 46%, #e6f4f7 100%);
 }
 
 button, input, select, textarea {

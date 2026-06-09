@@ -181,6 +181,7 @@ export function TicketPreview({
   onSelectLine,
   onUpdateLine,
   selectedLineId,
+  size = "normal",
   template,
   record
 }: {
@@ -191,11 +192,19 @@ export function TicketPreview({
   onSelectLine?: (lineId: string) => void;
   onUpdateLine?: (lineId: string, patch: Partial<TicketLine>) => void;
   selectedLineId?: string;
+  size?: "normal" | "large";
   template: WeighingTicketTemplate;
   record: WeighingRecord;
 }) {
   const visibleLines = (lines ?? normalizeTicketLines(template)).filter((line) => line.enabled && !["logo", "companyName", "ticketTitle", "qrCode"].includes(line.source));
   const [qrDataUrl, setQrDataUrl] = useState("");
+  const widthClass = size === "large"
+    ? template.paperWidth === "58mm" ? "max-w-[374px]" : "max-w-[504px]"
+    : template.paperWidth === "58mm" ? "max-w-[250px]" : "max-w-[308px]";
+  const textClass = size === "large" ? "text-[15px] leading-7" : "text-[12px] leading-5";
+  const paddingClass = size === "large" ? "p-4" : "p-3";
+  const innerPaddingClass = size === "large" ? "px-6 py-7" : "px-4 py-5";
+  const qrSizeClass = size === "large" ? "h-[52px] w-[52px]" : "h-[42px] w-[42px]";
 
   useEffect(() => {
     let active = true;
@@ -218,8 +227,8 @@ export function TicketPreview({
   }, [record, template.qrCodeEnabled]);
 
   return (
-    <div className="mx-auto w-full max-w-[280px] rounded-lg bg-slate-100 p-3">
-      <div className="rounded-sm bg-white px-4 py-5 font-mono text-[12px] leading-5 text-slate-950 shadow-card">
+    <div className={`mx-auto w-full ${widthClass} rounded-lg bg-slate-100 ${paddingClass}`}>
+      <div className={`rounded-sm bg-white ${innerPaddingClass} font-mono ${textClass} text-slate-950 shadow-card`}>
         {template.logoEnabled && <p className="text-center text-[10px]">[LOGO]</p>}
         {(template.fields.includes("companyName") || template.logoEnabled) && <p className="text-center font-bold">{template.companyName}</p>}
         {template.fields.includes("ticketTitle") || template.title ? <p className="text-center">{template.title}</p> : null}
@@ -234,8 +243,8 @@ export function TicketPreview({
         )}
         <Divider />
         {template.qrCodeEnabled && (
-          <div className="mx-auto my-3 grid h-[74px] w-[74px] place-items-center bg-white">
-            {qrDataUrl ? <img className="h-[74px] w-[74px]" src={qrDataUrl} alt="QR code LabConnect" /> : <QrCode className="h-10 w-10" />}
+          <div className={`mx-auto my-3 grid ${qrSizeClass} place-items-center bg-white`}>
+            {qrDataUrl ? <img className={qrSizeClass} src={qrDataUrl} alt="QR code LabConnect" /> : <QrCode className="h-10 w-10" />}
           </div>
         )}
         <p className="text-center text-[11px]">{template.footer}</p>
@@ -350,6 +359,7 @@ function getTicketFieldLine(line: TicketLine, record: WeighingRecord) {
     unit: { label: "Unité", value: record.unit },
     lotNumber: { label: "Lot", value: record.lotNumber },
     sampleId: { label: "Échantillon", value: record.sampleId },
+    comment: { label: "Commentaire", value: record.comment ?? "-" },
     methodName: { label: "Méthode", value: record.methodName ?? "-" },
     dryingTemperature: { label: "Température", value: record.dryingTemperature ?? "-" },
     dryingTime: { label: "Durée", value: record.dryingTime ?? "-" },
@@ -434,6 +444,7 @@ const ticketLineSources: Array<{ label: string; value: TicketLineSource }> = [
   { label: "Net", value: "netWeight" },
   { label: "Lot", value: "lotNumber" },
   { label: "Échantillon", value: "sampleId" },
+  { label: "Commentaire", value: "comment" },
   { label: "Méthode", value: "methodName" },
   { label: "Température", value: "dryingTemperature" },
   { label: "Durée", value: "dryingTime" },

@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeft, Check, ChevronRight, Download, FileText, History, Loader2, Pencil, Plus, Printer, Radar, ReceiptText, RotateCcw, Save, Scale, ScanLine, Search, Settings2, Trash2, Wifi, X, Zap } from "lucide-react";
-import { buildTicketQrPayload, parseTicketQrPayload, ticketQrToRecord, type WeighingRecord, type WeighingTicketTemplate } from "@labconnect/shared-types";
+import { buildTicketQrPayload, parseTicketQrPayload, ticketQrToRecord, type TicketField, type TicketLine, type WeighingRecord, type WeighingTicketTemplate } from "@labconnect/shared-types";
 import { Button, PrintTicketDesigner, TicketPreview } from "@labconnect/ui";
 import andLogo from "./assets/brands/and.png";
 import bizerbaLogo from "./assets/brands/bizerba.jpg";
@@ -17,9 +17,10 @@ import { atomS3Bridge, equipment, lastWeighingRecord, rawBalanceLines, standardT
 type View = "weighing" | "ticket" | "scan" | "history";
 type AppMode = "main" | "ticket-scan";
 type SettingsPanel = "weighing" | "ticket" | "scan";
-type BalanceAction = "tare" | "zero" | "print" | "request-weight";
+type BalanceAction = "tare" | "clear-tare" | "zero" | "print" | "request-weight";
 type SetupStep = "intro" | "scan" | "select";
 type ConnectionState = "connected" | "connecting" | "offline";
+type AppLanguage = "fr" | "en";
 type BalanceBrandId = "and" | "mettler" | "ohaus" | "precia-molen" | "precisa" | "sartorius" | "shimadzu" | "kern" | "bizerba" | "dini";
 type BalanceBrand = {
   id: BalanceBrandId;
@@ -42,6 +43,7 @@ type DetectedDevice = {
 };
 const MAX_STREAM_LINES = 4;
 const MAX_BALANCE_LINE_CHARS = 48;
+const BALANCE_STALE_MS = 3000;
 type WeighingSettings = {
   printPlusSign: boolean;
   decimalSeparator: "." | ",";
@@ -113,15 +115,85 @@ declare global {
 
 const balanceCommands: Record<BalanceAction, string> = {
   tare: "tare",
+  "clear-tare": "clear-tare",
   zero: "zero",
   "request-weight": "request-weight",
   print: "print"
 };
 
+const appCopy = {
+  fr: {
+    actionPrompt: "Choisir une action",
+    active: "Actif",
+    addBalance: "Nouvelle balance",
+    add: "Ajouter",
+    backHome: "Accueil",
+    balance: "Balance",
+    balanceAssociated: "Balance associée",
+    balanceConnected: "Balance connectée",
+    chooseManufacturer: "Fabricant",
+    comment: "Commentaire",
+    connecting: "Connexion",
+    manageBalances: "Gérer les balances",
+    newBadge: "Nouveau",
+    noData: "Aucune donnée",
+    noWeight: "Aucune pesée reçue de la balance.",
+    offline: "Hors ligne",
+    operator: "Opérateur",
+    print: "Imprimer",
+    ready: "Prêt",
+    readyFallback: "Prête",
+    readingBadge: "Lecture",
+    scanTicket: "Scanner ticket",
+    serial: "Série",
+    serialNumber: "Numéro de série",
+    simulation: "Simulation",
+    sample: "Échantillon",
+    tare: "Tare",
+    ticket: "Ticket",
+    weighing: "Pesée",
+    zero: "Zéro"
+  },
+  en: {
+    actionPrompt: "Choose an action",
+    active: "Active",
+    addBalance: "New scale",
+    add: "Add",
+    backHome: "Home",
+    balance: "Scale",
+    balanceAssociated: "Scale paired",
+    balanceConnected: "Scale connected",
+    chooseManufacturer: "Manufacturer",
+    comment: "Comment",
+    connecting: "Connecting",
+    manageBalances: "Manage scales",
+    newBadge: "New",
+    noData: "No data",
+    noWeight: "No weight received from the scale.",
+    offline: "Offline",
+    operator: "Operator",
+    print: "Print",
+    ready: "Ready",
+    readyFallback: "Ready",
+    readingBadge: "Read",
+    scanTicket: "Scan ticket",
+    serial: "Serial",
+    serialNumber: "Serial number",
+    simulation: "Simulation",
+    sample: "Sample",
+    tare: "Tare",
+    ticket: "Ticket",
+    weighing: "Weighing",
+    zero: "Zero"
+  }
+} satisfies Record<AppLanguage, Record<string, string>>;
+
 export function App() {
   const [operator, setOperator] = useLocalState("labconnect.operator", "Opérateur 01");
   const [lotNumber, setLotNumber] = useLocalState("labconnect.lot", "LC-2048");
   const [sampleId, setSampleId] = useLocalState("labconnect.sample", "ECH-001");
+  const [comment, setComment] = useLocalState("labconnect.comment", "");
+  const [language, setLanguage] = useLocalState("labconnect.language", "fr");
   const [ticketTemplate, setTicketTemplate] = useLocalObject<WeighingTicketTemplate>("labconnect.ticket-template", standardTicketTemplate);
   const [history, setHistory] = useLocalObject<WeighingRecord[]>("labconnect.weighing-history", weighingHistory);
   const [savedDevice, setSavedDevice] = useLocalObject<DetectedDevice | null>("labconnect.selected-device", null);
@@ -129,7 +201,10 @@ export function App() {
   const [weighingSettings, setWeighingSettings] = useLocalObject<WeighingSettings>("labconnect.weighing-settings", defaultWeighingSettings);
   const [scanSettings, setScanSettings] = useLocalObject<ScanSettings>("labconnect.scan-settings", defaultScanSettings);
   const [autoAssociate, setAutoAssociate] = useLocalBoolean("labconnect.auto-associate", false);
-  const [lines, setLines] = useState(rawBalanceLines.slice(0, MAX_STREAM_LINES));
+  const [lines, setLines] = useState<string[]>([]);
+  const [lastBalanceFrameAt, setLastBalanceFrameAt] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+  const [tareValue, setTareValue] = useState("");
   const [appMode, setAppMode] = useState<AppMode>("main");
   const [view, setView] = useState<View>("weighing");
   const [settingsPanel, setSettingsPanel] = useState<SettingsPanel | null>(null);
@@ -142,9 +217,22 @@ export function App() {
   const [scannedRecord, setScannedRecord] = useState<WeighingRecord | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const simulatedWeightRef = useRef(1248.52);
+  const appLanguage: AppLanguage = language === "en" ? "en" : "fr";
+  const copy = appCopy[appLanguage];
 
   const atomS3Url = `ws://${atomS3Bridge.ipAddress}:${atomS3Bridge.port}/ws`;
-  const displayLines = useMemo(() => lines.map((line) => formatBalanceFrame(line, weighingSettings)), [lines, weighingSettings]);
+  const isBalanceLive = selectedDevice ? now - lastBalanceFrameAt < BALANCE_STALE_MS : false;
+  const displayLines = useMemo(() => isBalanceLive ? lines.map((line) => formatBalanceFrame(line, weighingSettings)) : [], [isBalanceLive, lines, weighingSettings]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    if (ticketTemplate.fields.includes("comment")) return;
+    setTicketTemplate(addCommentToTicketTemplate(ticketTemplate));
+  }, [ticketTemplate.id]);
 
   useEffect(() => {
     if (isSimulation) {
@@ -178,6 +266,7 @@ export function App() {
         }
         const nextLines = normalizeBalanceMessage(event.data);
         if (nextLines.length === 0) return;
+        setLastBalanceFrameAt(Date.now());
         setLines((current) => [...nextLines, ...current].slice(0, MAX_STREAM_LINES));
       };
       socket.onerror = () => setConnectionState("offline");
@@ -232,6 +321,7 @@ export function App() {
     if (!isSimulation || !selectedDevice) return;
     const emitWeight = () => {
       simulatedWeightRef.current += (Math.random() - 0.47) * 0.08;
+      setLastBalanceFrameAt(Date.now());
       setLines((current) => [formatSimulatedWeight(simulatedWeightRef.current), ...current].slice(0, MAX_STREAM_LINES));
     };
     emitWeight();
@@ -251,10 +341,20 @@ export function App() {
     return () => window.removeEventListener("popstate", handleBack);
   }, [appMode, selectedDevice?.id]);
 
+  useEffect(() => {
+    if (!selectedDevice) return;
+    if (view !== "weighing" && view !== "ticket") {
+      setView("weighing");
+    }
+  }, [selectedDevice, view]);
+
   const currentRecord = useMemo<WeighingRecord>(() => {
-    const rawBalanceLine = lines[0] ?? "";
-    const displayFrame = formatBalanceFrame(rawBalanceLine, weighingSettings);
-    const liveWeight = applyDecimalSeparator(parseWeightForTicket(rawBalanceLine), weighingSettings.decimalSeparator);
+    const rawBalanceLine = isBalanceLive ? lines[0] ?? "" : "";
+    const displayFrame = rawBalanceLine ? formatBalanceFrame(rawBalanceLine, weighingSettings) : "";
+    const liveWeight = displayFrame ? parseWeightForTicket(displayFrame) : "";
+    const netMeasurement = parseWeightMeasurement(liveWeight);
+    const tareMeasurement = parseWeightMeasurement(tareValue);
+    const grossWeight = netMeasurement ? formatWeightMeasurement(netMeasurement.value + (tareMeasurement?.value ?? 0), netMeasurement.unit, Math.max(netMeasurement.decimals, tareMeasurement?.decimals ?? 0), netMeasurement.separator) : "";
     return {
       ...lastWeighingRecord,
       id: history[0]?.id ?? lastWeighingRecord.id,
@@ -263,20 +363,22 @@ export function App() {
       balanceName: selectedDevice?.name || selectedDevice?.model || lastWeighingRecord.balanceName,
       lotNumber,
       sampleId,
-      rawBalanceLine: displayFrame,
-      weight: displayFrame,
-      grossWeight: liveWeight,
-      tareWeight: "0.00 g",
-      netWeight: liveWeight,
+      comment,
+      rawBalanceLine: displayFrame || "Aucune pesée",
+      weight: displayFrame || "Aucune pesée",
+      grossWeight: grossWeight || liveWeight || "-",
+      tareWeight: tareValue || "0 g",
+      netWeight: liveWeight || "-",
       commandResponses: {
         "?ID": selectedDevice?.deviceId || SIMULATED_DEVICE.deviceId,
         "?SN": selectedDevice?.serialNumber || SIMULATED_DEVICE.serialNumber,
         "?TN": selectedDevice?.model || SIMULATED_DEVICE.model
       }
     };
-  }, [history, lines, lotNumber, operator, sampleId, selectedDevice, weighingSettings]);
+  }, [comment, history, isBalanceLive, lines, lotNumber, operator, sampleId, selectedDevice, tareValue, weighingSettings]);
 
   const captureCurrentLine = () => {
+    if (!isBalanceLive) return;
     const record: WeighingRecord = {
       ...currentRecord,
       id: `w-${Date.now()}`
@@ -288,17 +390,33 @@ export function App() {
   const sendBalanceCommand = (command: BalanceAction) => {
     if (isSimulation) {
       if (command === "zero" || command === "tare") {
+        if (command === "tare" && isBalanceLive) {
+          setTareValue(parseWeightForTicket(formatBalanceFrame(lines[0] ?? "", weighingSettings)));
+        }
         simulatedWeightRef.current = 0;
+        setLastBalanceFrameAt(Date.now());
         setLines((current) => [formatSimulatedWeight(0), ...current].slice(0, MAX_STREAM_LINES));
         setPrintStatus(command === "tare" ? "Tare simulée" : "Zéro simulé");
         return;
       }
+      if (command === "clear-tare") {
+        setTareValue("");
+        setPrintStatus("Tare effacée");
+        return;
+      }
       if (command === "request-weight") {
+        setLastBalanceFrameAt(Date.now());
         setLines((current) => [formatSimulatedWeight(simulatedWeightRef.current), ...current].slice(0, MAX_STREAM_LINES));
       }
       return;
     }
 
+    if (command === "tare" && isBalanceLive) {
+      setTareValue(parseWeightForTicket(formatBalanceFrame(lines[0] ?? "", weighingSettings)));
+    }
+    if (command === "clear-tare") {
+      setTareValue("");
+    }
     const socket = socketRef.current;
     if (socket?.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify({ type: "command", command: balanceCommands[command] }));
@@ -326,6 +444,10 @@ export function App() {
   };
 
   const printCurrentTicket = () => {
+    if (!isBalanceLive) {
+      setPrintStatus("Aucune pesée reçue");
+      return;
+    }
     captureCurrentLine();
     printRecordTicket(currentRecord);
   };
@@ -345,6 +467,7 @@ export function App() {
     setDetectedDevice(device);
     setSelectedDevice(device);
     setSetupStep("select");
+    setView("weighing");
   };
 
   const updateSavedDevice = (updatedDevice: DetectedDevice) => {
@@ -374,6 +497,7 @@ export function App() {
   const startSimulation = () => {
     setIsSimulation(true);
     setDetectedDevice(SIMULATED_DEVICE);
+    setLastBalanceFrameAt(Date.now());
     setLines([formatSimulatedWeight(simulatedWeightRef.current), ...rawBalanceLines].slice(0, MAX_STREAM_LINES));
     window.setTimeout(() => setSetupStep("select"), 260);
   };
@@ -423,6 +547,7 @@ export function App() {
     setOperator(record.operator || operator);
     setLotNumber(record.lotNumber || lotNumber);
     setSampleId(record.sampleId || sampleId);
+    setComment(record.comment || comment);
     setAppMode("main");
     setView("weighing");
   };
@@ -486,6 +611,8 @@ export function App() {
               onAutoAssociateChange={setAutoAssociate}
               onConnectSavedDevice={connectSavedDevice}
               onDeleteSavedDevice={deleteSavedDevice}
+              language={appLanguage}
+              onLanguageChange={(nextLanguage) => setLanguage(nextLanguage)}
               onOpenTicketScan={openStandaloneScan}
               onSaveDevice={saveDetectedDevice}
               onStartScan={() => setSetupStep("scan")}
@@ -500,30 +627,105 @@ export function App() {
               {selectedDevice ? (
                 <button className="inline-flex min-h-11 items-center gap-2 rounded-full bg-surface-soft px-4 text-sm font-bold text-slate-700 transition active:scale-[0.98]" type="button" onClick={resetDeviceSelection}>
                   <ArrowLeft className="h-4 w-4" />
-                  Accueil
+                  {copy.backHome}
                 </button>
               ) : (
                 <div>
-                  <p className="text-sm font-semibold text-slate-500">LabConnect</p>
-                  <h1 className="text-[30px] font-bold leading-9 tracking-normal">Print</h1>
+                  <h1 className="text-[30px] font-bold leading-9 tracking-normal">LabConnect Print</h1>
                 </div>
               )}
               {selectedDevice && (
                 <div className="min-w-0 flex-1 text-center">
-                  <p className="text-sm font-semibold text-slate-500">Session balance</p>
-                  <h1 className="truncate text-[24px] font-bold leading-8 tracking-normal">{selectedDevice.name || selectedDevice.model || "Balance"}</h1>
+                  <h1 className="truncate text-[24px] font-bold leading-8 tracking-normal">LabConnect Print</h1>
                 </div>
               )}
-              <ConnectionPill isSimulation={isSimulation} state={connectionState} />
-            </header>
-            {selectedDevice && (
-              <div className="mt-3 inline-flex min-h-10 items-center gap-2 rounded-full bg-surface-soft px-3 text-xs font-bold text-slate-600">
-                <Scale className="h-3.5 w-3.5" />
-                {selectedDevice.model || selectedDevice.name}
-                {isSimulation && <span className="rounded-full bg-blue-50 px-2 py-1 text-blue-700">Simulation</span>}
+              <div className="flex items-center gap-2">
+                <LanguageToggle language={appLanguage} onChange={(nextLanguage) => setLanguage(nextLanguage)} />
+                <ConnectionPill copy={copy} isSimulation={isSimulation} state={connectionState} />
               </div>
-            )}
+            </header>
 
+            {selectedDevice ? (
+              <div className="mt-4 grid gap-4 lg:grid-cols-[92px_minmax(360px,1fr)_minmax(340px,0.86fr)]">
+                <nav className="grid grid-cols-1 gap-2 rounded-2xl border border-white/70 bg-white/60 p-1 shadow-card backdrop-blur lg:sticky lg:top-4 lg:self-start">
+                  <SessionTabButton active={view === "weighing"} icon={Scale} label={copy.weighing} onClick={() => setView("weighing")} />
+                </nav>
+
+                <section className="min-w-0">
+                    <div className="rounded-lg border border-white/80 bg-white/80 p-4 shadow-card backdrop-blur">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div>
+                          <h2 className="text-lg font-black">{copy.ticket}</h2>
+                          <p className="text-sm text-slate-500">{ticketTemplate.paperWidth} · {ticketTemplate.name}</p>
+                        </div>
+                        <Button variant="ghost" size="icon" aria-label="Réglages ticket" onClick={() => setSettingsPanel("ticket")}>
+                          <Settings2 className="h-5 w-5" />
+                        </Button>
+                      </div>
+                      <TicketPreview size="large" template={ticketTemplate} record={currentRecord} />
+                    </div>
+                </section>
+
+                <aside className="rounded-lg border border-white/80 bg-white/80 p-3 shadow-card backdrop-blur lg:sticky lg:top-3 lg:self-start">
+                  <div className="flex items-center gap-3">
+                    <img className="h-16 w-20 rounded-lg bg-surface-soft object-contain p-2" src={selectedDevice.photo || equipment[0].image} alt={selectedDevice.name || "Balance"} />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-semibold text-slate-500">{copy.balance}</p>
+                      <h2 className="truncate text-lg font-bold tracking-normal">{selectedDevice.name || selectedDevice.model || copy.balance}</h2>
+                      <p className="mt-1 truncate text-xs font-medium text-slate-500">{selectedDevice.serialNumber ? `${copy.serialNumber} : ${selectedDevice.serialNumber}` : copy.balanceAssociated}</p>
+                    </div>
+                    <Button variant="ghost" size="icon" aria-label="Options pesée" onClick={() => setSettingsPanel("weighing")}>
+                      <Settings2 className="h-5 w-5" />
+                    </Button>
+                  </div>
+
+                  <div className={`mt-3 min-h-[146px] overflow-hidden rounded-[22px] p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] ${isBalanceLive ? "bg-[linear-gradient(135deg,#050816_0%,#10251f_54%,#2f28d8_145%)] text-white" : "bg-amber-50 text-amber-950"}`}>
+                    <div className="flex items-center justify-between gap-3">
+                      <p className={`text-sm font-semibold ${isBalanceLive ? "text-white/58" : "text-amber-700"}`}>{copy.weighing}</p>
+                      <span className={`rounded-full px-2.5 py-1 text-xs font-black ${isBalanceLive ? "bg-green-500/15 text-green-300" : "bg-amber-100 text-amber-800"}`}>{isBalanceLive ? copy.active : copy.noData}</span>
+                    </div>
+                    {isBalanceLive ? (
+                      <>
+                        <p className="mt-2 truncate text-right font-mono text-[36px] font-bold leading-10 tracking-normal tabular-nums">{displayLines[0]}</p>
+                        <div className="mt-2 max-h-[46px] space-y-1 overflow-hidden font-mono text-xs tabular-nums text-white/50">
+                          {displayLines.slice(1).map((line, index) => <p className="truncate text-right" key={`${line}-${index}`}>{line}</p>)}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="grid min-h-[104px] place-items-center text-center">
+                        <p className="max-w-sm text-base font-black">{copy.noWeight}</p>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-3 gap-2">
+                    <CompactField label={copy.operator} value={operator} onChange={setOperator} />
+                    <CompactField label="Lot" value={lotNumber} onChange={setLotNumber} />
+                    <CompactField label={copy.sample} value={sampleId} onChange={setSampleId} />
+                    <CompactField className="col-span-3" label={copy.comment} value={comment} onChange={setComment} />
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-2 gap-2">
+                    <Button className="col-span-2 min-h-[56px] rounded-2xl text-base" disabled={!isBalanceLive} onClick={printCurrentTicket}>
+                      <Printer className="h-5 w-5" />
+                      {copy.print}
+                    </Button>
+                    <LongPressButton className="min-h-[48px] rounded-2xl" disabled={!isBalanceLive && !tareValue} onClick={() => {
+                      if (isBalanceLive) sendBalanceCommand("tare");
+                    }} onLongPress={() => sendBalanceCommand("clear-tare")}>
+                      <RotateCcw className="h-4 w-4" />
+                      {tareValue ? `${copy.tare} ${tareValue}` : copy.tare}
+                    </LongPressButton>
+                    <Button variant="secondary" className="min-h-[48px] rounded-2xl" disabled={!isBalanceLive} onClick={() => sendBalanceCommand("zero")}>
+                      <Zap className="h-4 w-4" />
+                      {copy.zero}
+                    </Button>
+                  </div>
+                  <p className="mt-2 truncate rounded-2xl bg-surface-soft px-3 py-2 text-sm font-semibold text-slate-600">{printStatus}</p>
+                </aside>
+              </div>
+            ) : (
+              <>
             <div className="mt-5 grid grid-cols-4 gap-2 rounded-2xl bg-slate-100 p-1">
               <TabButton active={view === "weighing"} icon={Scale} label="Pesée" onClick={() => setView("weighing")} />
               <TabButton active={view === "ticket"} icon={ReceiptText} label="Ticket" onClick={() => setView("ticket")} />
@@ -533,40 +735,51 @@ export function App() {
 
         {view === "weighing" && (
           <section className="mt-5">
-            <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+            <div className="grid gap-4 lg:grid-cols-[minmax(0,0.85fr)_minmax(390px,0.65fr)]">
               <div className="rounded-lg border border-border bg-surface p-4 shadow-card">
               <div className="flex items-center gap-4">
-                <img className="h-20 w-24 rounded-lg bg-surface-soft object-contain p-2" src={selectedDevice?.photo || equipment[0].image} alt={selectedDevice?.name || "Balance"} />
+                <img className="h-20 w-24 rounded-lg bg-surface-soft object-contain p-2" src={equipment[0].image} alt="Balance" />
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-semibold text-slate-500">Poste de pesée</p>
-                  <h2 className="truncate text-xl font-bold tracking-normal">{selectedDevice?.name || "Balance"} + Imprimante LabConnect</h2>
-                  <p className="mt-1 truncate text-xs font-medium text-slate-500">{selectedDevice?.serialNumber ? `Numéro de série : ${selectedDevice.serialNumber}` : "Balance associée"}</p>
+                  <h2 className="truncate text-xl font-bold tracking-normal">Balance + Imprimante LabConnect</h2>
+                  <p className="mt-1 truncate text-xs font-medium text-slate-500">Balance associée</p>
                 </div>
                 <Button variant="ghost" size="icon" aria-label="Options pesée" onClick={() => setSettingsPanel("weighing")}>
                   <Settings2 className="h-5 w-5" />
                 </Button>
               </div>
 
-              <div className="mt-6 h-[244px] overflow-hidden rounded-[24px] bg-slate-950 p-5 text-white">
-                <p className="text-sm font-semibold text-white/58">Flux balance en temps réel</p>
-                <p className="mt-3 truncate font-mono text-[34px] font-bold leading-10 tracking-normal">{displayLines[0] ?? "En attente"}</p>
-                <div className="mt-4 max-h-[104px] space-y-1 overflow-hidden font-mono text-xs text-white/50">
-                  {displayLines.slice(1).map((line, index) => <p className="truncate" key={`${line}-${index}`}>{line}</p>)}
+              <div className={`mt-6 min-h-[178px] overflow-hidden rounded-[24px] p-5 ${isBalanceLive ? "bg-slate-950 text-white" : "bg-amber-50 text-amber-950"}`}>
+                <div className="flex items-center justify-between gap-3">
+                  <p className={`text-sm font-semibold ${isBalanceLive ? "text-white/58" : "text-amber-700"}`}>Pesée en temps réel</p>
+                  <span className={`rounded-full px-2.5 py-1 text-xs font-black ${isBalanceLive ? "bg-green-500/15 text-green-300" : "bg-amber-100 text-amber-800"}`}>{isBalanceLive ? "Actif" : "Aucune donnée"}</span>
                 </div>
+                {isBalanceLive ? (
+                  <>
+                    <p className="mt-3 truncate text-right font-mono text-[38px] font-bold leading-10 tracking-normal tabular-nums">{displayLines[0]}</p>
+                    <div className="mt-4 max-h-[78px] space-y-1 overflow-hidden font-mono text-xs tabular-nums text-white/50">
+                      {displayLines.slice(1).map((line, index) => <p className="truncate text-right" key={`${line}-${index}`}>{line}</p>)}
+                    </div>
+                  </>
+                ) : (
+                  <div className="grid min-h-[104px] place-items-center text-center">
+                    <p className="max-w-sm text-base font-black">Aucune pesée reçue de la balance.</p>
+                  </div>
+                )}
               </div>
 
               <div className="mt-4 grid grid-cols-2 gap-2">
-                <Button className="col-span-2 min-h-[64px] rounded-2xl text-base" onClick={printCurrentTicket}>
+                <Button className="col-span-2 min-h-[64px] rounded-2xl text-base" disabled={!isBalanceLive} onClick={printCurrentTicket}>
                   <Printer className="h-5 w-5" />
                   Imprimer le ticket
                 </Button>
-                <Button variant="secondary" className="min-h-[56px] rounded-2xl" onClick={captureCurrentLine}>Capturer</Button>
-                <Button variant="secondary" className="min-h-[56px] rounded-2xl" onClick={() => sendBalanceCommand("request-weight")}>Lire</Button>
-                <Button variant="secondary" className="min-h-[56px] rounded-2xl" onClick={() => sendBalanceCommand("tare")}>
+                <LongPressButton className="min-h-[56px] rounded-2xl" disabled={!isBalanceLive && !tareValue} onClick={() => {
+                  if (isBalanceLive) sendBalanceCommand("tare");
+                }} onLongPress={() => sendBalanceCommand("clear-tare")}>
                   <RotateCcw className="h-4 w-4" />
-                  Tare
-                </Button>
-                <Button variant="secondary" className="min-h-[56px] rounded-2xl" onClick={() => sendBalanceCommand("zero")}>
+                  {tareValue ? `Tare ${tareValue}` : "Tare"}
+                </LongPressButton>
+                <Button variant="secondary" className="min-h-[56px] rounded-2xl" disabled={!isBalanceLive} onClick={() => sendBalanceCommand("zero")}>
                   <Zap className="h-4 w-4" />
                   Zéro
                 </Button>
@@ -577,12 +790,12 @@ export function App() {
               <aside className="rounded-lg border border-border bg-surface p-4 shadow-card">
                 <div className="mb-3 flex items-center justify-between gap-3">
                   <div>
-                    <h2 className="text-base font-semibold">Aperçu ticket</h2>
-                    <p className="text-sm text-slate-500">{ticketTemplate.name}</p>
+                    <h2 className="text-lg font-black">Ticket</h2>
+                    <p className="text-sm text-slate-500">{ticketTemplate.paperWidth} · {ticketTemplate.name}</p>
                   </div>
                   <ReceiptText className="h-5 w-5 text-slate-500" />
                 </div>
-                <TicketPreview template={ticketTemplate} record={currentRecord} />
+                <TicketPreview size="large" template={ticketTemplate} record={currentRecord} />
               </aside>
             </div>
 
@@ -651,10 +864,13 @@ export function App() {
             </div>
           </section>
         )}
+              </>
+            )}
       </div>
         </>
       )}
       <ContextSettingsSheet
+        currentRecord={currentRecord}
         onClose={() => setSettingsPanel(null)}
         onScanSettingsChange={setScanSettings}
         onTicketTemplateChange={setTicketTemplate}
@@ -669,8 +885,8 @@ export function App() {
   );
 }
 
-function ConnectionPill({ isSimulation, state }: { isSimulation: boolean; state: ConnectionState }) {
-  const label = isSimulation ? "Simulation" : state === "connected" ? "Balance connectée" : state === "connecting" ? "Recherche" : "Hors ligne";
+function ConnectionPill({ copy, isSimulation, state }: { copy: (typeof appCopy)[AppLanguage]; isSimulation: boolean; state: ConnectionState }) {
+  const label = isSimulation ? copy.simulation : state === "connected" ? copy.balanceConnected : state === "connecting" ? copy.connecting : copy.offline;
   const className = isSimulation ? "bg-brand-soft text-blue-700" : state === "connected" ? "bg-success-soft text-green-700" : state === "connecting" ? "bg-warning-soft text-amber-700" : "bg-slate-100 text-slate-600";
   return (
     <div className={`inline-flex min-h-11 items-center rounded-full px-3 py-2 text-right text-xs font-bold ${className}`}>
@@ -679,7 +895,22 @@ function ConnectionPill({ isSimulation, state }: { isSimulation: boolean; state:
   );
 }
 
+function LanguageToggle({ language, onChange }: { language: AppLanguage; onChange: (language: AppLanguage) => void }) {
+  const nextLanguage = language === "fr" ? "en" : "fr";
+  return (
+    <button
+      aria-label="Changer de langue"
+      className="inline-flex min-h-11 items-center rounded-full border border-white/70 bg-white/74 px-3 text-xs font-black text-slate-700 shadow-sm transition active:scale-[0.98]"
+      type="button"
+      onClick={() => onChange(nextLanguage)}
+    >
+      {language.toUpperCase()}
+    </button>
+  );
+}
+
 function ContextSettingsSheet({
+  currentRecord,
   onClose,
   onScanSettingsChange,
   onTicketTemplateChange,
@@ -690,6 +921,7 @@ function ContextSettingsSheet({
   ticketTemplate,
   weighingSettings
 }: {
+  currentRecord: WeighingRecord;
   onClose: () => void;
   onScanSettingsChange: (settings: ScanSettings) => void;
   onTicketTemplateChange: (template: WeighingTicketTemplate) => void;
@@ -743,7 +975,7 @@ function ContextSettingsSheet({
 
   return (
     <div className="fixed inset-0 z-[60] grid touch-none place-items-center overscroll-contain bg-slate-950/62 p-4 backdrop-blur-sm animate-lab-screen" onClick={onClose}>
-      <section className="w-full max-w-[420px] touch-auto overscroll-contain rounded-[28px] bg-white p-5 shadow-sheet animate-lab-panel" onClick={(event) => event.stopPropagation()}>
+      <section className={`flex max-h-[calc(100vh-32px)] w-full touch-auto flex-col overscroll-contain rounded-[28px] bg-white p-5 shadow-sheet animate-lab-panel ${open === "ticket" ? "max-w-[980px]" : "max-w-[420px]"}`} onClick={(event) => event.stopPropagation()}>
         <div className="flex items-center justify-between gap-3">
           <div>
             <p className="text-sm font-bold text-slate-500">Réglages avancés</p>
@@ -754,8 +986,9 @@ function ContextSettingsSheet({
           </Button>
         </div>
 
+        <div className="mt-5 min-h-0 flex-1 overflow-y-auto pr-1">
         {open === "weighing" && (
-          <div className="mt-5 grid gap-3">
+          <div className="grid gap-3">
             <div className="rounded-2xl bg-slate-950 p-4 text-white">
               <p className="text-xs font-bold uppercase text-white/50">Aperçu valeur</p>
               <div className="mt-3 grid gap-2">
@@ -808,40 +1041,13 @@ function ContextSettingsSheet({
         )}
 
         {open === "ticket" && (
-          <div className="mt-5 grid gap-3">
-            <label className="grid gap-1.5 text-sm font-semibold text-slate-700">
-              Largeur papier par défaut
-              <select
-                className="min-h-12 rounded-2xl border border-border bg-white px-4 text-sm font-medium text-slate-950 outline-none focus:border-brand"
-                value={draftTicket.paperWidth}
-                onChange={(event) => setDraftTicket({ ...draftTicket, paperWidth: event.target.value as "58mm" | "80mm" })}
-              >
-                <option value="58mm">58 mm</option>
-                <option value="80mm">80 mm</option>
-              </select>
-            </label>
-            <NumberSetting
-              label="Nombre de copies"
-              min={1}
-              max={5}
-              value={draftTicket.copies}
-              onChange={(copies) => setDraftTicket({ ...draftTicket, copies })}
-            />
-            <ToggleSetting
-              checked={draftTicket.logoEnabled}
-              label="Imprimer le logo"
-              onChange={(logoEnabled) => setDraftTicket({ ...draftTicket, logoEnabled })}
-            />
-            <ToggleSetting
-              checked={draftTicket.qrCodeEnabled}
-              label="Imprimer le QR code"
-              onChange={(qrCodeEnabled) => setDraftTicket({ ...draftTicket, qrCodeEnabled })}
-            />
+          <div>
+            <PrintTicketDesigner template={draftTicket} templates={ticketTemplates} record={currentRecord} onTemplateChange={setDraftTicket} />
           </div>
         )}
 
         {open === "scan" && (
-          <div className="mt-5 grid gap-3">
+          <div className="grid gap-3">
             <ToggleSetting
               checked={draftScan.manualInput}
               label="Afficher la saisie manuelle"
@@ -866,6 +1072,7 @@ function ContextSettingsSheet({
             />
           </div>
         )}
+        </div>
         <div className="mt-5 grid grid-cols-2 gap-2">
           <Button variant="secondary" className="min-h-12 rounded-2xl" onClick={onClose}>Annuler</Button>
           <Button className="min-h-12 rounded-2xl" onClick={apply}>Appliquer</Button>
@@ -1049,92 +1256,47 @@ function ScanTicketView({
   };
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_340px]">
-      <section className="rounded-lg border border-border bg-surface p-4 shadow-card">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <h2 className="text-base font-semibold">Scanner un ticket</h2>
-            <p className="text-sm text-slate-500">Retrouvez une pesée avec le lecteur intégré.</p>
-          </div>
-          <Button variant="ghost" size="icon" aria-label="Options scan" onClick={onOpenSettings}>
-            <Settings2 className="h-5 w-5" />
-          </Button>
-        </div>
-
-        <div className="mt-4 rounded-[24px] bg-slate-950 p-5 text-white">
-          <div className="flex items-center gap-4">
-            <div className="grid h-16 w-16 shrink-0 place-items-center rounded-2xl bg-white/10">
-              <ScanLine className="h-8 w-8" />
-            </div>
-            <div className="min-w-0">
-              <p className="text-sm font-semibold text-white/60">Lecteur intégré</p>
-              <h3 className="text-xl font-black tracking-normal">Prêt à scanner</h3>
-              <p className="mt-1 text-sm font-medium text-white/58">{scanMessage}</p>
-            </div>
-          </div>
-          {lastScanSource && (
-            <p className="mt-4 rounded-2xl bg-white/10 px-3 py-2 text-xs font-bold text-white/72">
-              Dernière lecture : {lastScanSource === "integrated" ? "lecteur intégré" : lastScanSource === "manual" ? "saisie manuelle" : "test"}
-            </p>
-          )}
-        </div>
-
-        <div className="mt-4">
-          <Button className="min-h-12 w-full rounded-2xl" onClick={startIntegratedScan}>
-            <ScanLine className="h-4 w-4" />
-            Activer le scanner
-          </Button>
-        </div>
-
-        {settings.manualInput && (
-        <div className="mt-4 rounded-2xl bg-surface-soft p-3">
-          <label className="grid gap-2 text-sm font-semibold text-slate-700">
-            Lecteur code-barres ou collage manuel
-            <input
-              className="min-h-12 rounded-2xl border border-border bg-white px-4 font-mono text-xs outline-none focus:border-brand"
-              placeholder="Scannez ou collez le code ici"
-              value={manualCode}
-              onChange={(event) => setManualCode(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") submitManualCode();
-              }}
-            />
-          </label>
-          <div className="mt-2 grid grid-cols-2 gap-2">
-            <Button variant="secondary" onClick={submitManualCode}>Lire le code</Button>
-            <Button variant="secondary" onClick={() => handlePayload(buildTicketQrPayload(currentRecord), "test")}>Tester</Button>
-          </div>
-          </div>
-        )}
-      </section>
-
-      <ScanActivationDialog dialog={scanDialog} onClose={closeScanDialog} onRestart={startIntegratedScan} />
-
-      <aside className="rounded-lg border border-border bg-surface p-4 shadow-card">
+    <div className="mx-auto w-full max-w-[620px]">
+      <section className="rounded-[28px] border border-white/80 bg-white/86 p-5 shadow-card backdrop-blur">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <h2 className="text-base font-semibold">Ticket retrouvé</h2>
-            <p className="text-sm text-slate-500">{record ? "Informations du QR code" : "Aucun ticket scanné"}</p>
+            <h2 className="text-2xl font-black tracking-normal">Scanner un ticket</h2>
+            <p className="mt-1 text-sm font-semibold text-slate-500">{record ? "Ticket lu avec succès." : "Présentez le QR code au lecteur intégré."}</p>
           </div>
-          {record && <Button variant="secondary" size="icon" aria-label="Effacer" onClick={onClear}><X className="h-4 w-4" /></Button>}
         </div>
 
-        {record ? (
-          <>
-            <div className="mt-4 rounded-2xl bg-surface-soft p-4">
-              <TicketPreview template={{ ...ticketTemplate, qrCodeEnabled: true }} record={record} />
-              <dl className="mt-4 grid gap-2 text-sm">
-                <ScanRow label="Date" value={record.dateTime} />
-                <ScanRow label="Opérateur" value={record.operator || "-"} />
-                <ScanRow label="Lot" value={record.lotNumber || "-"} />
-                <ScanRow label="Échantillon" value={record.sampleId || "-"} />
-                <ScanRow label="Balance" value={record.balanceName || "-"} />
-                <ScanRow label="Net" value={record.netWeight || record.weight || "-"} />
-              </dl>
+        <div className="mt-5 rounded-[26px] bg-[linear-gradient(135deg,#050816_0%,#0f2b24_56%,#4338f2_150%)] p-5 text-white">
+          <div className="grid place-items-center py-3 text-center">
+            <div className="grid h-20 w-20 place-items-center rounded-[26px] bg-white/10">
+              <ScanLine className="h-10 w-10" />
             </div>
+            <h3 className="mt-4 text-2xl font-black tracking-normal">{record ? "Ticket retrouvé" : "Prêt à scanner"}</h3>
+            <p className="mt-2 max-w-sm text-sm font-semibold text-white/62">{record ? "Les informations du ticket sont disponibles ci-dessous." : scanMessage}</p>
+          </div>
+        </div>
 
-            <div className="mt-4 grid grid-cols-2 gap-2">
-              <Button className="col-span-2 min-h-12 rounded-2xl" onClick={() => onPrint(record)}>
+        {!record ? (
+          <Button className="mt-4 min-h-14 w-full rounded-2xl text-base" onClick={startIntegratedScan}>
+            <ScanLine className="h-5 w-5" />
+            Activer le scanner
+          </Button>
+        ) : (
+          <div className="mt-4 rounded-[24px] bg-surface-soft p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-black uppercase text-slate-500">Net</p>
+                <p className="mt-1 font-mono text-3xl font-black tracking-normal text-slate-950">{record.netWeight || record.weight || "-"}</p>
+              </div>
+              <Button variant="secondary" size="icon" aria-label="Effacer" onClick={onClear}><X className="h-4 w-4" /></Button>
+            </div>
+            <dl className="mt-4 grid gap-2 text-sm">
+              <ScanRow label="Date" value={record.dateTime} />
+              <ScanRow label="Lot" value={record.lotNumber || "-"} />
+              <ScanRow label="Échantillon" value={record.sampleId || "-"} />
+              <ScanRow label="Balance" value={record.balanceName || "-"} />
+            </dl>
+            <div className="mt-4 grid grid-cols-3 gap-2">
+              <Button className="col-span-3 min-h-12 rounded-2xl" onClick={() => onPrint(record)}>
                 <Printer className="h-4 w-4" />
                 Réimprimer
               </Button>
@@ -1146,15 +1308,13 @@ function ScanTicketView({
                 <FileText className="h-4 w-4" />
                 PDF
               </Button>
-              <Button variant="secondary" className="col-span-2 min-h-12 rounded-2xl" onClick={() => onUseRecord(record)}>Utiliser cette pesée</Button>
+              <Button variant="secondary" className="min-h-12 rounded-2xl" onClick={() => onUseRecord(record)}>Utiliser</Button>
             </div>
-          </>
-        ) : (
-          <div className="mt-4 grid min-h-[280px] place-items-center rounded-2xl bg-surface-soft p-6 text-center text-sm font-semibold text-slate-500">
-            Scannez le QR code d’un ticket LabConnect pour afficher ses informations.
           </div>
         )}
-      </aside>
+      </section>
+
+      <ScanActivationDialog dialog={scanDialog} onClose={closeScanDialog} onRestart={startIntegratedScan} />
     </div>
   );
 }
@@ -1232,9 +1392,11 @@ function SetupExperience({
   connectionState,
   device,
   isSimulation,
+  language,
   onAutoAssociateChange,
   onConnectSavedDevice,
   onDeleteSavedDevice,
+  onLanguageChange,
   onOpenTicketScan,
   onSaveDevice,
   onStartScan,
@@ -1247,9 +1409,11 @@ function SetupExperience({
   connectionState: ConnectionState;
   device: DetectedDevice | null;
   isSimulation: boolean;
+  language: AppLanguage;
   onAutoAssociateChange: (value: boolean) => void;
   onConnectSavedDevice: (device: DetectedDevice) => void;
   onDeleteSavedDevice: (deviceId: string) => void;
+  onLanguageChange: (language: AppLanguage) => void;
   onOpenTicketScan: () => void;
   onSaveDevice: (device: DetectedDevice) => void;
   onStartScan: () => void;
@@ -1260,6 +1424,7 @@ function SetupExperience({
 }) {
   const [manageOpen, setManageOpen] = useState(false);
   const [draftDevice, setDraftDevice] = useState<DetectedDevice | null>(null);
+  const copy = appCopy[language];
 
   useEffect(() => {
     if (step !== "select" || !device) return;
@@ -1294,13 +1459,13 @@ function SetupExperience({
       <div className="relative flex min-h-screen flex-col px-5 pb-6 pt-8">
         <header className="flex items-center justify-between animate-lab-fade-down">
           <div>
-            <p className="text-sm font-bold text-slate-500">LabConnect</p>
-            <h1 className="text-[40px] font-black leading-10 tracking-normal">Print</h1>
+            <h1 className="text-[34px] font-black leading-10 tracking-normal">LabConnect Print</h1>
           </div>
           <div className="flex items-center gap-2">
+            <LanguageToggle language={language} onChange={onLanguageChange} />
             <span className={`inline-flex min-h-10 items-center gap-2 rounded-full px-3 text-xs font-bold ${isSimulation ? "bg-brand-soft text-blue-700" : connectionState === "connected" ? "bg-success-soft text-green-700" : "bg-slate-100 text-slate-500"}`}>
               <Wifi className="h-4 w-4" />
-              {isSimulation ? "Simulation" : connectionState === "connected" ? "Prêt" : "Connexion"}
+              {isSimulation ? copy.simulation : connectionState === "connected" ? copy.ready : copy.connecting}
             </span>
             <Button variant="secondary" size="icon" aria-label="Gérer les balances" onClick={() => setManageOpen(true)}>
               <Settings2 className="h-4 w-4" />
@@ -1316,32 +1481,32 @@ function SetupExperience({
                   <div className="mx-auto grid h-24 w-24 place-items-center rounded-[30px] bg-slate-950 text-white shadow-float animate-lab-logo">
                     <Scale className="h-12 w-12" />
                   </div>
-                  <h2 className="mt-5 text-[32px] font-black leading-10 tracking-normal animate-lab-fade-up [animation-delay:90ms]">Choisir une action</h2>
+                  <h2 className="mt-5 text-[32px] font-black leading-10 tracking-normal animate-lab-fade-up [animation-delay:90ms]">{copy.actionPrompt}</h2>
                 </div>
-                <div className="mt-7 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <div className="mt-7 flex flex-wrap justify-center gap-3">
                   {savedDevices.map((saved, index) => (
-                    <HomeBalanceCard key={saved.id} delay={`${170 + index * 35}ms`} device={withBrandDefaults(saved)} onClick={() => onConnectSavedDevice(withBrandDefaults(saved))} />
+                    <HomeBalanceCard key={saved.id} copy={copy} delay={`${170 + index * 35}ms`} device={withBrandDefaults(saved)} onClick={() => onConnectSavedDevice(withBrandDefaults(saved))} />
                   ))}
                   <HomeActionCard
-                    badge="Nouveau"
-                    delay={`${190 + savedDevices.length * 35}ms`}
-                    description="Ajouter"
-                    icon={Plus}
-                    title="Nouvelle balance"
-                    onClick={onStartScan}
-                  />
-                  <HomeActionCard
-                    badge="Lecture"
+                    badge={copy.readingBadge}
                     delay={`${230 + savedDevices.length * 35}ms`}
                     description="QR code"
                     icon={ScanLine}
-                    title="Scanner ticket"
+                    title={copy.scanTicket}
                     onClick={onOpenTicketScan}
                   />
                 </div>
                 <button className="mx-auto mt-5 flex min-h-10 items-center gap-2 rounded-full px-4 text-sm font-bold text-slate-500 transition active:scale-[0.98] animate-lab-fade-up [animation-delay:310ms]" type="button" onClick={() => setManageOpen(true)}>
                   <Settings2 className="h-4 w-4" />
-                  Gérer les balances
+                  {copy.manageBalances}
+                </button>
+                <button
+                  className="absolute bottom-6 right-6 inline-flex min-h-14 items-center gap-3 rounded-full bg-brand px-5 text-base font-black text-white shadow-float transition active:scale-[0.98]"
+                  type="button"
+                  onClick={onStartScan}
+                >
+                  <Plus className="h-5 w-5" />
+                  {copy.addBalance}
                 </button>
               </div>
             )}
@@ -1441,7 +1606,7 @@ function HomeActionCard({
 }) {
   return (
     <button
-      className={`group flex min-h-[104px] w-full items-center gap-4 rounded-[26px] border border-border bg-white p-4 text-left shadow-card transition-[transform,box-shadow,background-color,opacity] duration-200 ease-out active:scale-[0.99] animate-lab-fade-up ${disabled ? "opacity-58" : "hover:shadow-float"}`}
+      className={`group flex min-h-[172px] w-full max-w-[246px] items-center gap-4 rounded-[26px] border border-border bg-white p-4 text-left shadow-card transition-[transform,box-shadow,background-color,opacity] duration-200 ease-out active:scale-[0.99] animate-lab-fade-up ${disabled ? "opacity-58" : "hover:shadow-float"}`}
       disabled={disabled}
       style={{ animationDelay: delay }}
       type="button"
@@ -1460,25 +1625,23 @@ function HomeActionCard({
   );
 }
 
-function HomeBalanceCard({ delay, device, onClick }: { delay: string; device: DetectedDevice; onClick: () => void }) {
+function HomeBalanceCard({ copy, delay, device, onClick }: { copy: (typeof appCopy)[AppLanguage]; delay: string; device: DetectedDevice; onClick: () => void }) {
   return (
     <button
-      className="group flex min-h-[172px] flex-col justify-between rounded-[26px] border border-border bg-white p-4 text-left shadow-card transition-[transform,box-shadow] duration-200 ease-out active:scale-[0.99] hover:shadow-float animate-lab-fade-up"
+      className="group flex min-h-[190px] w-full max-w-[274px] flex-col justify-between overflow-hidden rounded-[26px] border border-border bg-white p-3 text-left shadow-card transition-[transform,box-shadow] duration-200 ease-out active:scale-[0.99] hover:shadow-float animate-lab-fade-up"
       style={{ animationDelay: delay }}
       type="button"
       onClick={onClick}
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="relative">
-          <img className="h-20 w-24 rounded-2xl bg-surface-soft object-contain p-2" src={device.photo || equipment[0].image} alt="" />
-          {device.brandLogo && <img className="absolute -bottom-2 -right-2 max-h-7 max-w-16 rounded-lg bg-white px-1.5 py-1 shadow-card" src={device.brandLogo} alt={device.brandName ?? ""} />}
-        </div>
-        <ChevronRight className="mt-2 h-5 w-5 text-slate-400 transition-transform duration-200 group-active:translate-x-0.5" />
+      <div className="relative h-28 overflow-hidden rounded-[22px] bg-[linear-gradient(135deg,#eff8ed_0%,#e2f5f1_100%)]">
+        <img className="absolute inset-0 h-full w-full scale-[1.08] object-cover mix-blend-multiply transition-transform duration-200 ease-out group-active:scale-[1.04]" src={device.photo || equipment[0].image} alt="" />
+        {device.brandLogo && <img className="absolute bottom-2 right-2 max-h-8 max-w-[82px] rounded-xl bg-white/92 px-2 py-1.5 shadow-card" src={device.brandLogo} alt={device.brandName ?? ""} />}
+        <ChevronRight className="absolute right-3 top-3 h-5 w-5 rounded-full bg-white/78 p-0.5 text-slate-400 shadow-sm transition-transform duration-200 group-active:translate-x-0.5" />
       </div>
-      <div className="mt-4 min-w-0">
-        <p className="text-xs font-black uppercase text-slate-500">{device.brandName || "Balance"}</p>
-        <h3 className="mt-1 truncate text-lg font-black leading-6 tracking-normal text-slate-950">{device.name || device.model || "Balance"}</h3>
-        <p className="mt-1 truncate text-xs font-semibold text-slate-500">{device.serialNumber ? `Série : ${device.serialNumber}` : device.model || "Prête"}</p>
+      <div className="mt-3 min-w-0 px-1">
+        <p className="text-xs font-black uppercase text-slate-500">{device.brandName || copy.balance}</p>
+        <h3 className="mt-1 truncate text-lg font-black leading-6 tracking-normal text-slate-950">{device.name || device.model || copy.balance}</h3>
+        <p className="mt-1 truncate text-xs font-semibold text-slate-500">{device.serialNumber ? `${copy.serial} : ${device.serialNumber}` : device.model || copy.readyFallback}</p>
       </div>
     </button>
   );
@@ -1568,11 +1731,11 @@ function SavedDeviceCard({ device, isSimulation, onClick }: { device: DetectedDe
   return <div className="flex w-full items-center gap-4 rounded-[24px] border border-border bg-surface-soft p-4 text-left animate-lab-device-card">{content}</div>;
 }
 
-function CompactField({ label, onChange, value }: { label: string; onChange: (value: string) => void; value: string }) {
+function CompactField({ className = "", label, onChange, value }: { className?: string; label: string; onChange: (value: string) => void; value: string }) {
   return (
-    <label className="grid gap-1.5 text-xs font-black text-slate-600">
+    <label className={`grid min-w-0 gap-1 text-xs font-black text-slate-600 ${className}`}>
       {label}
-      <input className="min-h-11 rounded-2xl border border-border bg-white px-3 text-sm font-semibold text-slate-950 outline-none focus:border-brand" value={value} onChange={(event) => onChange(event.target.value)} />
+      <input className="min-h-10 w-full min-w-0 rounded-2xl border border-border bg-white px-3 text-sm font-semibold text-slate-950 outline-none focus:border-brand" value={value} onChange={(event) => onChange(event.target.value)} />
     </label>
   );
 }
@@ -1712,6 +1875,71 @@ function TabButton({ active, icon: Icon, label, onClick }: { active: boolean; ic
   );
 }
 
+function SessionTabButton({ active, icon: Icon, label, onClick }: { active: boolean; icon: typeof Scale; label: string; onClick: () => void }) {
+  return (
+    <button className={`flex min-h-16 flex-col items-center justify-center gap-1 rounded-xl text-xs font-black transition lg:min-h-[84px] ${active ? "bg-white text-slate-950 shadow-card" : "text-slate-500"}`} type="button" onClick={onClick}>
+      <Icon className="h-5 w-5" />
+      {label}
+    </button>
+  );
+}
+
+function LongPressButton({
+  children,
+  className,
+  disabled,
+  onClick,
+  onLongPress
+}: {
+  children: ReactNode;
+  className?: string;
+  disabled?: boolean;
+  onClick: () => void;
+  onLongPress: () => void;
+}) {
+  const longPressTimer = useRef<number | null>(null);
+  const didLongPress = useRef(false);
+
+  const clearTimer = () => {
+    if (longPressTimer.current !== null) {
+      window.clearTimeout(longPressTimer.current);
+      longPressTimer.current = null;
+    }
+  };
+
+  const start = () => {
+    if (disabled) return;
+    didLongPress.current = false;
+    clearTimer();
+    longPressTimer.current = window.setTimeout(() => {
+      didLongPress.current = true;
+      onLongPress();
+      clearTimer();
+    }, 750);
+  };
+
+  const end = () => {
+    if (disabled) return;
+    const wasLongPress = didLongPress.current;
+    clearTimer();
+    if (!wasLongPress) onClick();
+  };
+
+  return (
+    <Button
+      variant="secondary"
+      className={className}
+      disabled={disabled}
+      onPointerDown={start}
+      onPointerCancel={clearTimer}
+      onPointerLeave={clearTimer}
+      onPointerUp={end}
+    >
+      {children}
+    </Button>
+  );
+}
+
 function Field({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
   return (
     <label className="grid gap-1.5 text-sm font-semibold text-slate-700">
@@ -1785,10 +2013,56 @@ function clampNumber(value: number, min: number, max: number) {
 function parseWeightForTicket(rawLine: string) {
   const match = rawLine.match(/[+-]?\d+(?:[.,]\d+)?\s*(g|kg|mg)?/i);
   if (!match) return rawLine || "-";
-  const value = Number(match[0].replace(",", ".").replace(/[^\d.+-]/g, ""));
-  if (!Number.isFinite(value)) return rawLine || "-";
   const unit = match[1] ?? "g";
-  return `${value.toFixed(2)} ${unit}`;
+  const number = match[0].replace(/[^\d.,+-]/g, "");
+  return `${number} ${unit}`;
+}
+
+function addCommentToTicketTemplate(template: WeighingTicketTemplate): WeighingTicketTemplate {
+  const insertAfterSample = <T,>(items: T[], commentItem: T, isSample: (item: T) => boolean, isComment: (item: T) => boolean) => {
+    if (items.some(isComment)) return items;
+    const nextItems = [...items];
+    const sampleIndex = nextItems.findIndex(isSample);
+    nextItems.splice(sampleIndex >= 0 ? sampleIndex + 1 : nextItems.length, 0, commentItem);
+    return nextItems;
+  };
+
+  const commentLine: TicketLine = {
+    id: `line-comment-${Math.random().toString(36).slice(2, 9)}`,
+    label: "Commentaire",
+    source: "comment",
+    enabled: true,
+    bold: false,
+    fontSize: "normal",
+    valueAlign: "right"
+  };
+
+  return {
+    ...template,
+    fields: insertAfterSample<TicketField>(template.fields, "comment", (field) => field === "sampleId", (field) => field === "comment"),
+    lines: template.lines
+      ? insertAfterSample<TicketLine>(template.lines, commentLine, (line) => line.source === "sampleId", (line) => line.source === "comment")
+      : template.lines
+  };
+}
+
+function parseWeightMeasurement(weight: string) {
+  const match = weight.match(/([+-]?\d+(?:[.,]\d+)?)\s*(mg|kg|g)?/i);
+  if (!match) return null;
+  const rawNumber = match[1] ?? "";
+  const normalizedNumber = rawNumber.replace(",", ".");
+  const value = Number(normalizedNumber);
+  if (!Number.isFinite(value)) return null;
+  const unit = (match[2] ?? "g").toLowerCase();
+  const decimals = rawNumber.includes(".") || rawNumber.includes(",") ? rawNumber.split(/[.,]/)[1]?.length ?? 0 : 0;
+  const separator: "." | "," = rawNumber.includes(",") ? "," : ".";
+  return { decimals, separator, unit, value };
+}
+
+function formatWeightMeasurement(value: number, unit: string, decimals: number, separator: "." | ",") {
+  const rounded = value.toFixed(Math.max(0, decimals));
+  const text = decimals > 0 ? rounded.replace(".", separator) : rounded;
+  return `${text} ${unit}`;
 }
 
 function parseDeviceMessage(data: unknown): DetectedDevice | null {
@@ -2007,6 +2281,7 @@ function buildPrintableTicket(record: WeighingRecord, template: WeighingTicketTe
     ["Opérateur", record.operator],
     ["Lot", record.lotNumber],
     ["Échantillon", record.sampleId],
+    ["Commentaire", record.comment ?? ""],
     ["Balance", record.balanceName],
     ["Ligne brute", record.rawBalanceLine],
     ["Brut", record.grossWeight ?? ""],

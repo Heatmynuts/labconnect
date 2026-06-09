@@ -4,6 +4,11 @@
 
 // LabConnect Print - AtomS3 bridge
 // Version: AtomS3 display + A&D identity queries (?TN / ?SN / ?ID)
+// A&D profile:
+// - tare: T
+// - clear tare: PT:0 g
+// - zero: RZ
+// - request weight: Q
 // Board: ESP32-S3 / M5Stack AtomS3
 // Arduino libraries:
 // - M5AtomS3 by M5Stack
@@ -189,6 +194,11 @@ void onWebSocketEvent(uint8_t clientId, WStype_t type, uint8_t* payload, size_t 
 }
 
 void handleCommand(const String& message) {
+  if (message.indexOf("clear-tare") >= 0) {
+    sendBalanceCommand("PT:0 g");
+    return;
+  }
+
   if (message.indexOf("tare") >= 0) {
     sendBalanceCommand("T");
     return;

@@ -170,6 +170,7 @@ class SunmiPrinterBridge(private val context: Context) {
       ticketLine("Operateur", recordValue(record, "operator"), lineWidth),
       ticketLine("Lot", recordValue(record, "lotNumber"), lineWidth),
       ticketLine("Echantillon", recordValue(record, "sampleId"), lineWidth),
+      ticketLine("Commentaire", recordValue(record, "comment", ""), lineWidth),
       separator,
       ticketLine("Poids", raw, lineWidth),
       ticketLine("Brut", recordValue(record, "grossWeight", raw), lineWidth),
@@ -194,6 +195,7 @@ class SunmiPrinterBridge(private val context: Context) {
       "unit" -> ticketLine("Unite", recordValue(record, "unit"), lineWidth)
       "lotNumber" -> ticketLine("Lot", recordValue(record, "lotNumber"), lineWidth)
       "sampleId" -> ticketLine("Echantillon", recordValue(record, "sampleId"), lineWidth)
+      "comment" -> ticketLine("Commentaire", recordValue(record, "comment", ""), lineWidth)
       "methodName" -> ticketLine("Methode", recordValue(record, "methodName"), lineWidth)
       "dryingTemperature" -> ticketLine("Temperature", recordValue(record, "dryingTemperature"), lineWidth)
       "dryingTime" -> ticketLine("Duree", recordValue(record, "dryingTime"), lineWidth)
@@ -246,6 +248,7 @@ class SunmiPrinterBridge(private val context: Context) {
       "unit" -> recordValue(record, "unit")
       "lotNumber" -> recordValue(record, "lotNumber")
       "sampleId" -> recordValue(record, "sampleId")
+      "comment" -> recordValue(record, "comment", "")
       "methodName" -> recordValue(record, "methodName")
       "dryingTemperature" -> recordValue(record, "dryingTemperature")
       "dryingTime" -> recordValue(record, "dryingTime")
@@ -280,6 +283,7 @@ class SunmiPrinterBridge(private val context: Context) {
       .put("op", recordValue(record, "operator"))
       .put("lot", recordValue(record, "lotNumber"))
       .put("sample", recordValue(record, "sampleId"))
+      .put("comment", recordValue(record, "comment", ""))
       .put("balance", recordValue(record, "balanceName"))
       .put("raw", recordValue(record, "rawBalanceLine"))
       .put("weight", recordValue(record, "weight", recordValue(record, "rawBalanceLine")))
@@ -298,7 +302,7 @@ class SunmiPrinterBridge(private val context: Context) {
     val output = ByteArrayOutputStream()
 
     output.write(byteArrayOf(0x1D, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00))
-    output.write(byteArrayOf(0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, 0x06))
+    output.write(byteArrayOf(0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, 0x04))
     output.write(byteArrayOf(0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, 0x31))
     output.write(byteArrayOf(0x1D, 0x28, 0x6B, (storeLength and 0xFF).toByte(), ((storeLength shr 8) and 0xFF).toByte(), 0x31, 0x50, 0x30))
     output.write(qrData)
