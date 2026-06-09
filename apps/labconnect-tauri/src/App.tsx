@@ -2069,15 +2069,17 @@ function parseDeviceMessage(data: unknown): DetectedDevice | null {
   const raw = String(data ?? "").trim();
   if (!raw.startsWith("{")) return null;
   try {
-    const payload = JSON.parse(raw) as Partial<DetectedDevice> & { type?: string; kind?: string };
+    const payload = JSON.parse(raw) as Partial<DetectedDevice> & { type?: string; kind?: string; brand?: string; brandName?: string };
     if (payload.type !== "device" || payload.kind !== "balance") return null;
     const serialNumber = normalizeMetadata(payload.serialNumber);
     const deviceId = normalizeMetadata(payload.deviceId);
-    const model = normalizeMetadata(payload.model) || "FZ-i Series";
-    const brand = inferBrand({ model, name: payload.name || "", serialNumber, deviceId });
+    const model = normalizeMetadata(payload.model) || "Balance";
+    const brand = payload.brand
+      ? balanceBrands.find((b) => b.id === payload.brand) ?? inferBrand({ model, name: payload.name || "", serialNumber, deviceId })
+      : inferBrand({ model, name: payload.name || "", serialNumber, deviceId });
     return {
       id: serialNumber || deviceId || model,
-      name: payload.name || `A&D ${model}`,
+      name: payload.name || `${brand.name} ${model}`,
       model,
       serialNumber,
       deviceId,
@@ -2100,16 +2102,12 @@ function requestDeviceInfo(socket: WebSocket | null) {
 }
 
 function createFallbackDevice(): DetectedDevice {
-  const brand = balanceBrands[0];
   return {
-    id: "and-fz-i",
-    name: "A&D FZ-i Series",
-    model: "FZ-i Series",
+    id: "unknown-balance",
+    name: "Balance",
+    model: "Balance",
     serialNumber: "",
     deviceId: "",
-    brandId: brand.id,
-    brandName: brand.name,
-    brandLogo: brand.logo,
     photo: equipment[0].image,
     transport: "",
     ipAddress: "",

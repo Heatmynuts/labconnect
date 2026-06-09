@@ -278,10 +278,10 @@ export type AtomS3BridgeSettings = {
   port: number;
   transport: "http" | "websocket" | "mqtt";
   serial: {
-    baudRate: 2400;
-    dataBits: 7;
-    parity: "even";
-    stopBits: 1;
+    baudRate: number;
+    dataBits: number;
+    parity: "none" | "even" | "odd";
+    stopBits: number;
   };
 };
 
