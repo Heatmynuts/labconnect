@@ -18,6 +18,7 @@ type View = "weighing" | "ticket" | "scan" | "history";
 type AppMode = "main" | "ticket-scan";
 type SettingsPanel = "weighing" | "ticket" | "scan";
 type BalanceAction = "tare" | "clear-tare" | "zero" | "print" | "request-weight";
+type TerminalFormat = "auto" | "v3mix" | "v3";
 type SetupStep = "intro" | "scan" | "select";
 type ConnectionState = "connected" | "connecting" | "offline";
 type AppLanguage = "fr" | "en";
@@ -105,6 +106,9 @@ declare global {
     LabConnectScanner?: {
       startScan: (timeoutMs: number) => string;
       stopScan: () => string;
+    };
+    LabConnectDevice?: {
+      model: string;
     };
   }
 
@@ -194,6 +198,8 @@ export function App() {
   const [sampleId, setSampleId] = useLocalState("labconnect.sample", "ECH-001");
   const [comment, setComment] = useLocalState("labconnect.comment", "");
   const [language, setLanguage] = useLocalState("labconnect.language", "fr");
+  const [terminalFormat, setTerminalFormat] = useLocalState("labconnect.terminal-format", "auto");
+  const layout = useTerminalLayout(terminalFormat as TerminalFormat);
   const [ticketTemplate, setTicketTemplate] = useLocalObject<WeighingTicketTemplate>("labconnect.ticket-template", standardTicketTemplate);
   const [history, setHistory] = useLocalObject<WeighingRecord[]>("labconnect.weighing-history", weighingHistory);
   const [savedDevice, setSavedDevice] = useLocalObject<DetectedDevice | null>("labconnect.selected-device", null);
@@ -619,6 +625,9 @@ export function App() {
               onStartSimulation={startSimulation}
               savedDevices={savedDevices}
               step={setupStep}
+              terminalFormat={terminalFormat as TerminalFormat}
+              detectedFormat={layout.format}
+              onTerminalFormatChange={(f) => setTerminalFormat(f)}
               onUpdateSavedDevice={updateSavedDevice}
             />
           )}
@@ -646,12 +655,14 @@ export function App() {
             </header>
 
             {selectedDevice ? (
-              <div className="mt-4 grid gap-4 lg:grid-cols-[92px_minmax(360px,1fr)_minmax(340px,0.86fr)]">
+              <div className={`mt-4 grid gap-4 ${layout.isPortrait ? "" : "lg:grid-cols-[92px_minmax(360px,1fr)_minmax(340px,0.86fr)]"}`}>
+                {!layout.isPortrait && (
                 <nav className="grid grid-cols-1 gap-2 rounded-2xl border border-white/70 bg-white/60 p-1 shadow-card backdrop-blur lg:sticky lg:top-4 lg:self-start">
                   <SessionTabButton active={view === "weighing"} icon={Scale} label={copy.weighing} onClick={() => setView("weighing")} />
                 </nav>
+                )}
 
-                <section className="min-w-0">
+                <section className={`min-w-0 ${layout.isPortrait ? "order-2" : ""}`}>
                     <div className="rounded-lg border border-white/80 bg-white/80 p-4 shadow-card backdrop-blur">
                       <div className="mb-3 flex items-center justify-between gap-3">
                         <div>
@@ -662,11 +673,11 @@ export function App() {
                           <Settings2 className="h-5 w-5" />
                         </Button>
                       </div>
-                      <TicketPreview size="large" template={ticketTemplate} record={currentRecord} />
+                      <TicketPreview size={layout.isPortrait ? "normal" : "large"} template={ticketTemplate} record={currentRecord} />
                     </div>
                 </section>
 
-                <aside className="rounded-lg border border-white/80 bg-white/80 p-3 shadow-card backdrop-blur lg:sticky lg:top-3 lg:self-start">
+                <aside className={`rounded-lg border border-white/80 bg-white/80 p-3 shadow-card backdrop-blur ${layout.isPortrait ? "order-1" : "lg:sticky lg:top-3 lg:self-start"}`}>
                   <div className="flex items-center gap-3">
                     <img className="h-16 w-20 rounded-lg bg-surface-soft object-contain p-2" src={selectedDevice.photo || equipment[0].image} alt={selectedDevice.name || "Balance"} />
                     <div className="min-w-0 flex-1">
@@ -795,7 +806,7 @@ export function App() {
                   </div>
                   <ReceiptText className="h-5 w-5 text-slate-500" />
                 </div>
-                <TicketPreview size="large" template={ticketTemplate} record={currentRecord} />
+                <TicketPreview size={layout.isPortrait ? "normal" : "large"} template={ticketTemplate} record={currentRecord} />
               </aside>
             </div>
 
@@ -1390,6 +1401,7 @@ function ScanActivationDialog({
 function SetupExperience({
   autoAssociate,
   connectionState,
+  detectedFormat,
   device,
   isSimulation,
   language,
@@ -1401,12 +1413,15 @@ function SetupExperience({
   onSaveDevice,
   onStartScan,
   onStartSimulation,
+  onTerminalFormatChange,
   onUpdateSavedDevice,
   savedDevices,
-  step
+  step,
+  terminalFormat
 }: {
   autoAssociate: boolean;
   connectionState: ConnectionState;
+  detectedFormat: "v3" | "v3mix";
   device: DetectedDevice | null;
   isSimulation: boolean;
   language: AppLanguage;
@@ -1418,9 +1433,11 @@ function SetupExperience({
   onSaveDevice: (device: DetectedDevice) => void;
   onStartScan: () => void;
   onStartSimulation: () => void;
+  onTerminalFormatChange: (format: TerminalFormat) => void;
   onUpdateSavedDevice: (device: DetectedDevice) => void;
   savedDevices: DetectedDevice[];
   step: SetupStep;
+  terminalFormat: TerminalFormat;
 }) {
   const [manageOpen, setManageOpen] = useState(false);
   const [draftDevice, setDraftDevice] = useState<DetectedDevice | null>(null);
@@ -1463,6 +1480,16 @@ function SetupExperience({
           </div>
           <div className="flex items-center gap-2">
             <LanguageToggle language={language} onChange={onLanguageChange} />
+            <select
+              value={terminalFormat}
+              onChange={(e) => onTerminalFormatChange(e.target.value as TerminalFormat)}
+              className="h-10 rounded-full border border-slate-200 bg-white px-3 text-xs font-bold text-slate-600 outline-none"
+              aria-label="Format terminal"
+            >
+              <option value="auto">Auto ({detectedFormat === "v3" ? "V3" : "V3Mix"})</option>
+              <option value="v3mix">V3Mix (paysage)</option>
+              <option value="v3">V3 (portrait)</option>
+            </select>
             <span className={`inline-flex min-h-10 items-center gap-2 rounded-full px-3 text-xs font-bold ${isSimulation ? "bg-brand-soft text-blue-700" : connectionState === "connected" ? "bg-success-soft text-green-700" : "bg-slate-100 text-slate-500"}`}>
               <Wifi className="h-4 w-4" />
               {isSimulation ? copy.simulation : connectionState === "connected" ? copy.ready : copy.connecting}
@@ -2325,4 +2352,18 @@ function escapeHtml(value: string) {
     .replaceAll(">", "&gt;")
     .replaceAll("\"", "&quot;")
     .replaceAll("'", "&#039;");
+}
+
+function useTerminalLayout(terminalFormat: TerminalFormat): { isPortrait: boolean; format: "v3" | "v3mix" } {
+  const [isPortraitWindow, setIsPortraitWindow] = useState(() => window.innerHeight > window.innerWidth);
+
+  useEffect(() => {
+    const onResize = () => setIsPortraitWindow(window.innerHeight > window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  if (terminalFormat === "v3") return { isPortrait: true, format: "v3" };
+  if (terminalFormat === "v3mix") return { isPortrait: false, format: "v3mix" };
+  return { isPortrait: isPortraitWindow, format: isPortraitWindow ? "v3" : "v3mix" };
 }
