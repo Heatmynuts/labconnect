@@ -2,6 +2,7 @@
 #include "cst816.h"
 #include "lcd_bl_pwm_bsp.h"
 #include "lcd_config.h"
+#include "extra/libs/qrcode/qrcodegen.h"
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -45,6 +46,15 @@ static volatile int32_t encRaw = 0;
 #define BRAND_SARTORIUS 2
 static const char* BRAND_NAMES[] = { "A&D", "Mettler", "Sartorius" };
 
+#define PROTOCOL_UNKNOWN        0
+#define PROTOCOL_AD             1
+#define PROTOCOL_SICS           2
+#define PROTOCOL_SARTORIUS_SBI  3
+
+#define LINE_ENDING_CR          0
+#define LINE_ENDING_LF          1
+#define LINE_ENDING_CRLF        2
+
 // =====================================================
 // PROTOCOLE
 // =====================================================
@@ -65,6 +75,7 @@ static const char* BRAND_NAMES[] = { "A&D", "Mettler", "Sartorius" };
 #define MSG_CONFIG_RESP     0x0C
 #define MSG_CONFIG_SET      0x0D
 #define MSG_CONFIG_ACK      0x0E
+#define MSG_PURGE_RESET     0x0F
 
 typedef struct __attribute__((packed)) {
   uint8_t  magic;
@@ -102,7 +113,8 @@ static_assert(sizeof(msg_t) == 208, "msg_t must be 208 bytes");
 typedef struct {
   uint8_t  id;
   uint8_t  mac[6];
-  char     name[32];
+  char     nodeName[32];
+  char     typeName[32];
   unsigned long lastSeen;
   bool     active;
   bool     persisted;
@@ -122,6 +134,7 @@ typedef struct {
   char     zeroCmd[16];
   float    capacity;
   float    resolution;
+  char     firmwareVariant[24];
   char     balanceId[20];
   char     displayLabel[32];
 } node_entry_t;
@@ -129,7 +142,8 @@ typedef struct {
 typedef struct __attribute__((packed)) {
   uint8_t  id;
   uint8_t  mac[6];
-  char     name[32];
+  char     nodeName[32];
+  char     typeName[32];
 } stored_node_t;
 
 typedef struct __attribute__((packed)) {
@@ -172,10 +186,17 @@ typedef struct __attribute__((packed)) {
   float    resolution;
 } stored_profile_t;
 
-enum UIState { STATE_IDLE, STATE_SCANNING, STATE_LIST, STATE_CONNECTED };
+enum UIState { STATE_IDLE, STATE_SCANNING, STATE_LIST, STATE_CONNECTED, STATE_WIFI_QR };
 
 // Pending command tracking
 typedef enum { PEND_NONE, PEND_BALANCE, PEND_PING, PEND_INFO } pending_kind_t;
+
+static uint8_t protocolForBrand(uint8_t brand);
+static uint8_t lineEndingForBrand(uint8_t brand);
+static void normalizeNodeIdentity(int idx);
+void setNodeDisplayLabel(int idx);
+static bool sendBalanceCmdAndWait(int idx, const char* cmd, char* out, size_t outSize, unsigned long timeoutMs);
+static bool parseBalanceIdFromReply(uint8_t brand, const char* raw, char* out, size_t outSize);
 
 // =====================================================
 // Globals
@@ -184,7 +205,7 @@ static node_entry_t nodes[MAX_NODES];
 static int  nodeCount = 0;
 static int  selectedNode = -1;
 static int  listScroll = 0;
-static UIState uiState = STATE_IDLE;
+static UIState uiState = STATE_LIST;
 static float tareOffset[MAX_NODES];
 static float pendingTareAdjust[MAX_NODES];
 static bool  pendingTare[MAX_NODES];
@@ -232,7 +253,12 @@ static int profileCount = 0;
 static bool soundEnabled = true;
 static bool serialReplyBeepEnabled = true;
 static bool serialReplyHapticEnabled = true;
+static float parseWeightValue(const char* raw);
 static volatile bool pendingBeep = false;
+static bool apiBalanceReplyPending = false;
+static bool apiBalanceReplyReady = false;
+static uint8_t apiBalanceReplyNodeId = 0;
+static char apiBalanceReply[128] = "";
 static int  flashBtnIdx = -1;
 static unsigned long flashBtnAt = 0;
 #define BTN_FLASH_MS 120
@@ -386,7 +412,7 @@ static const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <style>
 :root{--blue:#007AFF;--green:#34C759;--red:#FF3B30;--bg:#F2F2F7;--surface:#FFF;--border:rgba(60,60,67,.12);--text:#000;--text2:#3C3C43;--text3:rgba(60,60,67,.55);--text4:rgba(60,60,67,.25)}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
 
 /* Header */
 .hdr{background:rgba(255,255,255,.82);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:.5px solid var(--border);position:sticky;top:0;z-index:50;height:56px;display:flex;align-items:center;padding:0 20px;gap:12px}
@@ -396,11 +422,18 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;backg
 .hdr-sub{font-size:12px;color:var(--text3);margin-top:1px}
 
 /* Content */
-.cnt{padding:18px 12px;max-width:760px;margin:0 auto}
+.cnt{padding:18px 12px calc(24px + env(safe-area-inset-bottom));max-width:760px;margin:0 auto}
 
 /* Section label */
 .slbl{font-size:12px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;margin:24px 0 8px 4px}
 .slbl:first-child{margin-top:0}
+.shead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:24px 0 8px 4px;flex-wrap:wrap}
+.shead .slbl{margin:0}
+.sactions{display:flex;align-items:center;gap:8px}
+.sbtn{border:none;border-radius:11px;background:var(--surface);color:var(--blue);box-shadow:0 1px 0 var(--border);height:34px;padding:0 12px;font-size:13px;font-weight:600;font-family:inherit;display:inline-flex;align-items:center;gap:8px;cursor:pointer;transition:transform .1s,opacity .15s}
+.sbtn:active{transform:scale(.97);opacity:.8}
+.sbtn[disabled]{opacity:.55;cursor:default}
+.sbtn svg{width:15px;height:15px;stroke:currentColor;stroke-width:2;fill:none}
 
 /* Info bar */
 .ibar{background:var(--surface);border-radius:14px;padding:14px 16px;display:flex;align-items:center;gap:14px;box-shadow:0 1px 0 var(--border)}
@@ -462,23 +495,32 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;backg
 @keyframes rot{to{transform:rotate(360deg)}}
 
 /* Toast */
-.toast{position:fixed;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%) translateY(80px);opacity:0;background:rgba(28,28,30,.9);color:#fff;padding:11px 20px;border-radius:14px;font-size:14px;font-weight:500;white-space:nowrap;transition:transform .3s cubic-bezier(.34,1.56,.64,1),opacity .3s;z-index:200;pointer-events:none;max-width:calc(100vw - 40px);text-align:center}
+.toast{position:fixed;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%) translateY(80px);opacity:0;background:rgba(28,28,30,.9);color:#fff;padding:11px 20px;border-radius:14px;font-size:14px;font-weight:500;white-space:normal;transition:transform .3s cubic-bezier(.34,1.56,.64,1),opacity .3s;z-index:200;pointer-events:none;max-width:calc(100vw - 40px);text-align:center}
 .toast.show{transform:translateX(-50%) translateY(0);opacity:1}
 .toast.ok:before{content:'✓  ';color:#4CD964}
 .toast.err:before{content:'✕  ';color:#FF6B6B}
 
 /* Sheet overlay */
-.ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.38);z-index:100;align-items:flex-end}
+.ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.38);z-index:100;align-items:center;justify-content:center;padding:16px}
 .ov.open{display:flex}
 
-/* Bottom sheet */
-.sheet{background:var(--bg);border-radius:20px 20px 0 0;width:100%;max-height:91vh;overflow-y:auto;overflow-x:hidden;padding-bottom:env(safe-area-inset-bottom);animation:sup .28s cubic-bezier(.32,1,.23,1)}
-@keyframes sup{from{transform:translateY(100%)}to{transform:translateY(0)}}
-.sh-handle{width:36px;height:4px;background:var(--text4);border-radius:2px;margin:10px auto 0}
+/* Modal */
+.sheet{background:var(--bg);border-radius:22px;width:min(720px,calc(100vw - 24px));max-height:min(90vh,960px);overflow-y:auto;overflow-x:hidden;box-shadow:0 28px 80px rgba(0,0,0,.22);animation:modalin .22s ease-out}
+@keyframes modalin{from{transform:translateY(12px) scale(.98);opacity:.2}to{transform:translateY(0) scale(1);opacity:1}}
+.sh-handle{display:none}
 .sh-hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;position:sticky;top:0;background:rgba(242,242,247,.88);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:.5px solid var(--border);z-index:1}
 .sh-title{font-size:17px;font-weight:700}
 .sh-close{color:var(--blue);font-size:15px;font-weight:600;cursor:pointer;padding:4px 0 4px 12px}
 .sh-body{padding:16px}
+.action-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0 4px}
+.btn-sm{padding:12px 14px;font-size:14px}
+@media (max-width:640px){
+  .ov{align-items:flex-end;padding:0}
+  .sheet{width:100%;max-height:92vh;border-radius:20px 20px 0 0;animation:modalup .24s cubic-bezier(.32,1,.23,1)}
+  @keyframes modalup{from{transform:translateY(100%)}to{transform:translateY(0)}}
+  .sh-handle{display:block;width:36px;height:4px;background:var(--text4);border-radius:2px;margin:10px auto 0}
+  .action-row{grid-template-columns:1fr}
+}
 
 /* Form */
 .fg{background:var(--surface);border-radius:14px;overflow:hidden;margin-bottom:4px;box-shadow:0 1px 0 var(--border)}
@@ -490,6 +532,11 @@ select.fc{-webkit-appearance:none;appearance:none;cursor:pointer}
 input.fc[type=text]{max-width:130px}
 input.fc[type=number]{max-width:76px}
 
+@media (max-width:920px){
+  .cnt{max-width:680px}
+  .ngrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+
 /* Buttons */
 .btns{display:flex;flex-direction:column;gap:10px;margin-top:20px}
 .btn{width:100%;padding:15px;border:none;border-radius:14px;font-size:16px;font-weight:600;font-family:inherit;cursor:pointer;letter-spacing:-.1px;transition:opacity .15s,transform .1s}
@@ -500,6 +547,30 @@ input.fc[type=number]{max-width:76px}
 .sw{width:51px;height:31px;background:var(--text4);border-radius:16px;position:relative;transition:background .2s;flex-shrink:0;pointer-events:none}
 .sw::after{content:'';position:absolute;width:27px;height:27px;border-radius:50%;background:#fff;top:2px;left:2px;transition:left .2s;box-shadow:0 2px 4px rgba(0,0,0,.2)}
 .sw.on{background:var(--green)}.sw.on::after{left:22px}
+
+@media (max-width:640px){
+  .hdr{padding:0 14px}
+  .cnt{padding:14px 10px calc(24px + env(safe-area-inset-bottom))}
+  .ibar{display:grid;grid-template-columns:auto 1fr;align-items:center}
+  .ibar-ip{grid-column:1/-1;padding-left:36px;font-size:13px}
+  .ngrid{grid-template-columns:1fr;gap:12px}
+  .node-card{aspect-ratio:auto;min-height:236px}
+  .node-card .nname{font-size:17px}
+  .node-card .ntype{font-size:13px}
+  .node-card .nbrand{font-size:12px}
+  .ov{align-items:flex-end;padding:0}
+  .sheet{width:100%;max-height:92vh;border-radius:20px 20px 0 0;animation:modalup .24s cubic-bezier(.32,1,.23,1)}
+  @keyframes modalup{from{transform:translateY(100%)}to{transform:translateY(0)}}
+  .sh-handle{display:block;width:36px;height:4px;background:var(--text4);border-radius:2px;margin:10px auto 0}
+  .sh-hdr{padding:14px 16px}
+  .sh-body{padding:14px}
+  .action-row{grid-template-columns:1fr}
+  .fr{display:block;padding:10px 16px 12px}
+  .fl{display:block;padding:0 0 6px;white-space:normal}
+  .fc{display:block;width:100%;max-width:none;padding:6px 0 0;text-align:left}
+  input.fc[type=text],input.fc[type=number]{max-width:none}
+  .btns{padding-bottom:calc(8px + env(safe-area-inset-bottom))}
+}
 </style>
 </head>
 <body>
@@ -523,7 +594,20 @@ input.fc[type=number]{max-width:76px}
     <div class="ibar-ip">192.168.4.1</div>
   </div>
 
-  <div class="slbl">Nodes</div>
+  <div class="shead">
+    <div class="slbl">Nodes</div>
+    <div class="sactions">
+      <button class="sbtn" id="scan-btn" onclick="startNodeScan()" aria-label="Rechercher des nodes">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M21 12a9 9 0 0 0-15.36-6.36"></path>
+          <path d="M3 4v5h5"></path>
+          <path d="M3 12a9 9 0 0 0 15.36 6.36"></path>
+          <path d="M21 20v-5h-5"></path>
+        </svg>
+        <span id="scan-btn-label">Rechercher</span>
+      </button>
+    </div>
+  </div>
   <div class="ngrid" id="nlist">
     <div class="loading"><div class="spin"></div></div>
   </div>
@@ -551,6 +635,13 @@ input.fc[type=number]{max-width:76px}
         <option value="both">Bip + vibration</option>
       </select>
     </div>
+    <div class="nrow" onclick="purgeNodes()">
+      <div class="avt" style="background:#FFF3F2;color:#C62828;font-size:18px">&#10006;</div>
+      <div class="ninfo">
+        <div class="nname">Purge des nodes</div>
+        <div class="nmeta">Efface la liste du knob et reinitialise les Atom en ligne</div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -566,16 +657,24 @@ input.fc[type=number]{max-width:76px}
     <div class="sh-body">
       <input type="hidden" id="c-id">
 
-      <div class="slbl">Identite</div>
+      <div class="slbl">Node</div>
       <div class="fg">
         <div class="fr">
-          <label class="fl">Identifiant</label>
-          <input class="fc" id="c-label" type="text" maxlength="31" placeholder="CDO 05">
+          <label class="fl">Node</label>
+          <input class="fc" id="c-node-ref" type="text" readonly placeholder="Node 01">
         </div>
         <div class="fr">
-          <label class="fl">Type</label>
-          <input class="fc" id="c-name" type="text" maxlength="31" placeholder="BA-225">
+          <label class="fl">Nom du node</label>
+          <input class="fc" id="c-node-name" type="text" maxlength="31" placeholder="Node paillasse 1">
         </div>
+        <div class="fr">
+          <label class="fl">Adresse MAC</label>
+          <input class="fc" id="c-mac" type="text" readonly placeholder="--:--:--:--:--:--">
+        </div>
+      </div>
+
+      <div class="slbl">Identite</div>
+      <div class="fg">
         <div class="fr">
           <label class="fl">Marque</label>
           <select class="fc" id="c-brand" onchange="onBrand()">
@@ -584,9 +683,41 @@ input.fc[type=number]{max-width:76px}
             <option value="2">Sartorius</option>
           </select>
         </div>
+        <div class="fr">
+          <label class="fl">Identifiant</label>
+          <input class="fc" id="c-label" type="text" maxlength="31" placeholder="CDO 05">
+        </div>
+        <div class="fr">
+          <label class="fl">ID balance</label>
+          <input class="fc" id="c-balance-id" type="text" maxlength="2" placeholder="05" oninput="syncLabelFromBalanceId()">
+        </div>
+        <div class="fr">
+          <label class="fl">Type</label>
+          <input class="fc" id="c-name" type="text" maxlength="31" placeholder="BA-225">
+        </div>
+      </div>
+
+      <div class="action-row">
+        <button class="btn btn-s btn-sm" onclick="readBalanceId()">Lire l'ID</button>
+        <button class="btn btn-s btn-sm" onclick="programBalanceId()">Ecrire l'ID</button>
+      </div>
+
+      <div id="mettler-write-wrap" style="display:none">
+        <div class="slbl">Programmation Mettler</div>
+        <div class="fg">
+          <div class="fr">
+            <label class="fl">Valeur a ecrire</label>
+            <input class="fc" id="c-balance-id-write" type="text" maxlength="2" placeholder="06" oninput="syncWriteBalanceId()">
+          </div>
+          <div class="fr">
+            <label class="fl">Commande envoyee</label>
+            <input class="fc" id="c-balance-id-cmd" type="text" readonly value='I10 ""'>
+          </div>
+        </div>
       </div>
 
       <div class="slbl">RS232</div>
+      <div id="transport-lock-note" class="nmeta" style="display:none;margin:0 4px 10px 4px">Parametres imposes par le firmware de l'AtomS3.</div>
       <div class="fg">
         <div class="fr">
           <label class="fl">Baud rate</label>
@@ -699,6 +830,7 @@ let profiles=[];
 let soundOn=true;
 let serialReplyBeepOn=true;
 let serialReplyHapticOn=true;
+let scanBusy=false;
 
 function currentSerialReplyMode(){
   if(serialReplyBeepOn && serialReplyHapticOn) return 'both';
@@ -721,16 +853,113 @@ function inferCdoId(node){
   return m?m[1]:'';
 }
 
+function normalizedBalanceIdValue(raw){
+  const text=(raw||'').toUpperCase().trim();
+  const m=text.match(/(0[0-9])/);
+  return m?m[1]:'';
+}
+
+function syncLabelFromBalanceId(){
+  const id=normalizedBalanceIdValue(document.getElementById('c-balance-id').value);
+  document.getElementById('c-balance-id').value=id;
+  if(id){
+    document.getElementById('c-label').value='CDO '+id;
+  }
+}
+
+function syncWriteBalanceId(){
+  const id=normalizedBalanceIdValue(document.getElementById('c-balance-id-write').value);
+  document.getElementById('c-balance-id-write').value=id;
+  document.getElementById('c-balance-id-cmd').value='I10 "'+id+'"';
+}
+
+function setMettlerWriteVisibility(brand){
+  const isMettler=parseInt(brand,10)===1;
+  const wrap=document.getElementById('mettler-write-wrap');
+  if(wrap) wrap.style.display=isMettler?'block':'none';
+  if(!isMettler){
+    document.getElementById('c-balance-id-write').value='';
+    document.getElementById('c-balance-id-cmd').value='I10 ""';
+  }else{
+    syncWriteBalanceId();
+  }
+}
+
+function setScanBusy(on){
+  scanBusy=!!on;
+  const btn=document.getElementById('scan-btn');
+  const lbl=document.getElementById('scan-btn-label');
+  if(!btn || !lbl) return;
+  btn.disabled=scanBusy;
+  lbl.textContent=scanBusy?'Recherche...':'Rechercher';
+}
+
+async function parseJsonResponse(r){
+  const raw=await r.text();
+  if(!raw) return {};
+  try{
+    return JSON.parse(raw);
+  }catch(e){
+    throw new Error((r.url||'api')+'_json_parse: '+raw.slice(0,240));
+  }
+}
+
+async function startNodeScan(){
+  if(scanBusy) return;
+  setScanBusy(true);
+  try{
+    const r=await fetch('/api/scan',{method:'POST'});
+    const d=await parseJsonResponse(r);
+    toast(r.ok?(d.message||'Recherche lancee'):(d.error||'Erreur scan'),r.ok);
+    if(r.ok){
+      loadNodes();
+      setTimeout(loadNodes,800);
+      setTimeout(loadNodes,2200);
+      setTimeout(loadNodes,4200);
+    }
+  }catch(e){
+    toast(String(e&&e.message?e.message:'Erreur reseau'),false);
+  }finally{
+    setTimeout(()=>setScanBusy(false),1200);
+  }
+}
+
+async function purgeNodes(){
+  if(!confirm('Purger tous les nodes sauvegardes du knob et reinitialiser les Atom actuellement en ligne ?')) return;
+  try{
+    const r=await fetch('/api/purge',{method:'POST'});
+    const d=await parseJsonResponse(r);
+    const msg=r.ok
+      ?((d.message||'Purge terminee')+(typeof d.remoteResetCount==='number'?' ('+d.remoteResetCount+' Atom reinitialise'+(d.remoteResetCount>1?'s':'')+')':''))
+      :(d.error||'Erreur purge');
+    toast(msg,r.ok);
+    if(r.ok){
+      nodes=[];
+      loadNodes();
+      setTimeout(loadNodes,1200);
+      setTimeout(loadNodes,3500);
+    }
+  }catch(e){
+    toast(String(e&&e.message?e.message:'Erreur reseau'),false);
+  }
+}
+
 async function loadNodes(){
   try{
     const r=await fetch('/api/nodes');
     if(!r.ok) throw new Error('nodes_http_'+r.status);
-    nodes=await r.json();
+    const raw=await r.text();
+    try{
+      nodes=JSON.parse(raw);
+    }catch(parseErr){
+      throw new Error('nodes_json_parse: '+String(parseErr&&parseErr.message?parseErr.message:parseErr)+' :: '+raw.slice(0,240));
+    }
     const n=nodes.length;
     document.getElementById('hdr-sub').textContent=n+' node'+(n!==1?'s':'');
     document.getElementById('ssid-name').textContent='BDP-Hub';
   }catch(e){
-    document.getElementById('nlist').innerHTML='<div class="empty"><div class="empty-ico">&#9888;</div><div class="empty-ttl">Erreur de connexion</div><div class="empty-sub">Verifiez la connexion WiFi</div></div>';
+    const msg=String(e&&e.message?e.message:e);
+    document.getElementById('nlist').innerHTML='<div class="empty"><div class="empty-ico">&#9888;</div><div class="empty-ttl">Erreur de connexion</div><div class="empty-sub">'+esc(msg)+'</div></div>';
     return;
   }
   try{
@@ -743,9 +972,13 @@ async function loadNodes(){
 async function loadProfiles(){
   try{
     const r=await fetch('/api/profiles');
-    profiles=await r.json();
+    if(!r.ok) throw new Error('profiles_http_'+r.status);
+    const raw=await r.text();
+    profiles=JSON.parse(raw);
     refreshProfileSelect();
-  }catch(e){}
+  }catch(e){
+    console.warn('loadProfiles failed',e);
+  }
 }
 
 async function loadSettings(){
@@ -835,10 +1068,13 @@ function render(){
     const cdoId=inferCdoId(n);
     const img=IMG_CDO[cdoId]||'';
     const identifier=n.label||((n.balanceId&&n.balanceId!=='?')?('CDO '+n.balanceId):'');
-    const type=n.name||'';
+    const type=n.type||n.typeName||'';
+    const mac=n.mac||'';
     const brand=c?c.brandName:'';
+    const firmware=c&&c.firmware?c.firmware:'';
+    const brandLine=firmware?(brand?brand+' • '+firmware:firmware):brand;
     const mediaHtml=img
-      ?('<div class="node-media"><img class="node-img" src="'+img+'" alt="'+(n.label||n.name||'Balance')+'"></div>')
+      ?('<div class="node-media"><img class="node-img" src="'+img+'" alt="'+(n.label||n.type||n.typeName||n.name||'Balance')+'"></div>')
       :('<div class="node-media"><div class="node-mark">'+(brand||'Profil client')+'</div></div>');
     return ''
       + '<div class="node-card '+(img?'has-img':'')+'" onclick="openConf('+n.id+')">'
@@ -847,14 +1083,15 @@ function render(){
       +   '<div class="ninfo">'
       +     '<div class="nname">'+(identifier||'CDO ?')+'</div>'
       +     '<div class="ntype">'+(type||'Type non renseigne')+'</div>'
-      +     '<div class="nbrand">'+(brand||'Marque non renseignee')+'</div>'
+      +     '<div class="nbrand">'+(brandLine||'Marque non renseignee')+'</div>'
+      +     '<div class="nbrand">'+mac+'</div>'
       +     '<div class="nstatus"><span class="nbadge '+(n.online?'bon':'boff')+'">'+(n.online?'En ligne':'Hors ligne')+'</span></div>'
       +   '</div>'
       +   '<div class="nacts">'
-      +     '<button class="ibtn" onclick="event.stopPropagation();openConf('+n.id+')" aria-label="Modifier '+(n.name||'node')+'">'
+      +     '<button class="ibtn" onclick="event.stopPropagation();openConf('+n.id+')" aria-label="Modifier '+((n.nodeName||n.name)||'node')+'">'
       +       '<svg viewBox="0 0 24 24" fill="none"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"/></svg>'
       +     '</button>'
-      +     '<button class="ibtn ibtn-del" onclick="event.stopPropagation();deleteNode('+n.id+')" aria-label="Supprimer '+(n.name||'node')+'">'
+      +     '<button class="ibtn ibtn-del" onclick="event.stopPropagation();deleteNode('+n.id+')" aria-label="Supprimer '+((n.nodeName||n.name)||'node')+'">'
       +       '<svg viewBox="0 0 24 24" fill="none"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5"/><path d="M14 11v5"/></svg>'
       +     '</button>'
       +   '</div>'
@@ -867,10 +1104,16 @@ function openConf(id){
   const identifier=n.label||((n.balanceId&&n.balanceId!=='?')?`CDO ${n.balanceId}`:'CDO ?');
   document.getElementById('sh-title').textContent=identifier+' · parametres';
   document.getElementById('c-id').value=id;
+  document.getElementById('c-node-ref').value='Node '+String(n.id).padStart(2,'0');
+  document.getElementById('c-mac').value=n.mac||'';
   document.getElementById('c-profile-name').value='';
   const c=n.configKnown?n.config:PR[0];
   document.getElementById('c-label').value=identifier;
-  document.getElementById('c-name').value=n.name;
+  document.getElementById('c-balance-id').value=normalizedBalanceIdValue(n.balanceId||identifier);
+  document.getElementById('c-balance-id-write').value=normalizedBalanceIdValue(n.balanceId||identifier);
+  syncWriteBalanceId();
+  document.getElementById('c-name').value=n.type||n.typeName||'';
+  document.getElementById('c-node-name').value=n.name||n.nodeName||'';
   sv('c-brand',n.configKnown?c.brand:0);
   sv('c-baud',c.baud);sv('c-par',c.parity);
   sv('c-db',c.dataBits);sv('c-sb',c.stopBits);
@@ -882,6 +1125,7 @@ function openConf(id){
   document.getElementById('c-zero').value=c.zeroCmd||'Z';
   document.getElementById('c-cap').value=c.capacity||MET.capacity;
   document.getElementById('c-res').value=c.resolution||MET.resolution;
+  setTransportLock(!!(c&&c.firmware&&c.firmware!=='ATOM_GENERIC'), c&&c.firmware?c.firmware:'');
   refreshProfileSelect();
   document.getElementById('ov').classList.add('open');
   document.querySelector('.sheet').scrollTop=0;
@@ -890,9 +1134,15 @@ function openConf(id){
 function openNewProfileConf(){
   document.getElementById('sh-title').textContent='Nouveau profil · parametres';
   document.getElementById('c-id').value='';
+  document.getElementById('c-node-ref').value='Profil';
+  document.getElementById('c-node-name').value='';
+  document.getElementById('c-mac').value='';
   document.getElementById('c-profile').value='';
   document.getElementById('c-profile-name').value='';
   document.getElementById('c-label').value='';
+  document.getElementById('c-balance-id').value='';
+  document.getElementById('c-balance-id-write').value='';
+  syncWriteBalanceId();
   document.getElementById('c-name').value='';
   sv('c-brand',0);
   onBrand();
@@ -901,6 +1151,7 @@ function openNewProfileConf(){
   sv('c-sw',0);
   document.getElementById('c-cap').value=MET.capacity;
   document.getElementById('c-res').value=MET.resolution;
+  setTransportLock(false,'');
   refreshProfileSelect();
   document.getElementById('ov').classList.add('open');
   document.querySelector('.sheet').scrollTop=0;
@@ -910,10 +1161,16 @@ function openProfileConfByIndex(index){
   const p=profiles[index];if(!p)return;
   document.getElementById('sh-title').textContent=(p.label||p.name||'Profil')+' · parametres';
   document.getElementById('c-id').value='';
+  document.getElementById('c-node-ref').value='Profil';
+  document.getElementById('c-node-name').value='';
+  document.getElementById('c-mac').value='';
   refreshProfileSelect();
   document.getElementById('c-profile').value=p.name||'';
   document.getElementById('c-profile-name').value=p.name||'';
   document.getElementById('c-label').value=p.label||'';
+  document.getElementById('c-balance-id').value=normalizedBalanceIdValue((p.balanceId||p.label||''));
+  document.getElementById('c-balance-id-write').value=normalizedBalanceIdValue((p.balanceId||p.label||''));
+  syncWriteBalanceId();
   document.getElementById('c-name').value=p.type||'';
   sv('c-brand',p.brand??0);
   sv('c-baud',p.baud);
@@ -928,6 +1185,7 @@ function openProfileConfByIndex(index){
   document.getElementById('c-zero').value=p.zeroCmd||'Z';
   document.getElementById('c-cap').value=p.capacity||MET.capacity;
   document.getElementById('c-res').value=p.resolution||MET.resolution;
+  setTransportLock(false,'');
   document.getElementById('ov').classList.add('open');
   document.querySelector('.sheet').scrollTop=0;
 }
@@ -950,14 +1208,50 @@ function syncProfileNameFromSelect(){
 }
 
 function sv(id,v){const e=document.getElementById(id);if(e)e.value=String(v);}
+function setTransportLock(locked, firmware){
+  const ids=['c-brand','c-baud','c-par','c-db','c-sb','c-rx','c-tx','c-sw','c-cmd','c-to','c-zero'];
+  ids.forEach(id=>{const el=document.getElementById(id); if(el) el.disabled=!!locked;});
+  const note=document.getElementById('transport-lock-note');
+  if(note){
+    note.style.display=locked?'block':'none';
+    note.textContent=locked?('Parametres imposes par le firmware '+firmware+'.'):'';
+  }
+}
 function closeSheet(){document.getElementById('ov').classList.remove('open');}
+function esc(s){return String(s||'').replace(/[&<>"]/g,m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[m]));}
 
 function onBrand(){
-  const p=PR[parseInt(document.getElementById('c-brand').value)];if(!p)return;
+  const brand=parseInt(document.getElementById('c-brand').value);
+  const p=PR[brand];if(!p)return;
   sv('c-baud',p.baud);sv('c-par',p.parity);sv('c-db',p.dataBits);sv('c-sb',p.stopBits);
   document.getElementById('c-cmd').value=p.pollCmd;
   document.getElementById('c-to').value=p.lineTimeout;
   document.getElementById('c-zero').value=p.zeroCmd||'Z';
+  setMettlerWriteVisibility(brand);
+}
+
+async function readBalanceId(){
+  const id=parseInt(document.getElementById('c-id').value);
+  if(!Number.isFinite(id) || id<=0){
+    toast('Choisissez un node',false);
+    return;
+  }
+  try{
+    const r=await fetch('/api/balance-id/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,brand:parseInt(document.getElementById('c-brand').value)})});
+    const d=await r.json();
+    if(!r.ok){
+      toast(d.error||'Lecture impossible',false);
+      return;
+    }
+  if(d.balanceId){
+      document.getElementById('c-balance-id').value=d.balanceId;
+      document.getElementById('c-balance-id-write').value=d.balanceId;
+      syncWriteBalanceId();
+      document.getElementById('c-label').value='CDO '+d.balanceId;
+    }
+    toast(d.message||('ID lu: '+(d.balanceId||d.raw||'?')),true);
+    await loadNodes();
+  }catch(e){toast('Erreur reseau',false);}
 }
 
 async function saveConf(){
@@ -966,22 +1260,7 @@ async function saveConf(){
     toast('Utilisez Sauver et appliquer ou Dupliquer depuis un node existant',false);
     return;
   }
-  const body={id,
-    label:document.getElementById('c-label').value.trim(),
-    name:document.getElementById('c-name').value.trim(),
-    brand:parseInt(document.getElementById('c-brand').value),
-    baud:parseInt(document.getElementById('c-baud').value),
-    parity:parseInt(document.getElementById('c-par').value),
-    dataBits:parseInt(document.getElementById('c-db').value),
-    stopBits:parseInt(document.getElementById('c-sb').value),
-    rxPin:parseInt(document.getElementById('c-rx').value),
-    txPin:parseInt(document.getElementById('c-tx').value),
-    swapRxTx:document.getElementById('c-sw').value==='1',
-    pollCmd:document.getElementById('c-cmd').value.trim(),
-    lineTimeout:parseInt(document.getElementById('c-to').value),
-    zeroCmd:document.getElementById('c-zero').value.trim()||'Z',
-    capacity:parseFloat(document.getElementById('c-cap').value)||MET.capacity,
-    resolution:parseFloat(document.getElementById('c-res').value)||MET.resolution};
+  const body={id,...currentConfigPayload()};
   closeSheet();
   try{
     const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -992,7 +1271,14 @@ async function saveConf(){
 }
 
 function currentConfigPayload(){
+  const balanceId=normalizedBalanceIdValue(document.getElementById('c-balance-id').value);
+  if(balanceId){
+    document.getElementById('c-balance-id').value=balanceId;
+    document.getElementById('c-label').value='CDO '+balanceId;
+  }
   return {
+    nodeName:document.getElementById('c-node-name').value.trim(),
+    balanceId,
     label:document.getElementById('c-label').value.trim(),
     name:document.getElementById('c-name').value.trim(),
     brand:parseInt(document.getElementById('c-brand').value),
@@ -1009,6 +1295,36 @@ function currentConfigPayload(){
     capacity:parseFloat(document.getElementById('c-cap').value)||MET.capacity,
     resolution:parseFloat(document.getElementById('c-res').value)||MET.resolution
   };
+}
+
+async function programBalanceId(){
+  const id=parseInt(document.getElementById('c-id').value);
+  if(!Number.isFinite(id) || id<=0){
+    toast('Choisissez un node Mettler',false);
+    return;
+  }
+  const brand=parseInt(document.getElementById('c-brand').value);
+  if(brand!==1){
+    toast('Disponible uniquement pour Mettler',false);
+    return;
+  }
+  const balanceId=normalizedBalanceIdValue(document.getElementById('c-balance-id-write').value);
+  if(!balanceId){
+    toast('Renseignez une valeur Mettler a ecrire',false);
+    return;
+  }
+  document.getElementById('c-balance-id-write').value=balanceId;
+  syncWriteBalanceId();
+  try{
+    const r=await fetch('/api/balance-id',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,balanceId})});
+    const d=await r.json();
+    toast(r.ok?(d.message||'ID programme'):(d.error||'Erreur'),r.ok);
+    if(r.ok){
+      document.getElementById('c-balance-id').value=balanceId;
+      document.getElementById('c-label').value='CDO '+balanceId;
+      await loadNodes();
+    }
+  }catch(e){toast('Erreur reseau',false);}
 }
 
 async function saveProfile(){
@@ -1114,13 +1430,14 @@ function deleteProfileByIndex(index){
 async function deleteNode(id){
   const n=nodes.find(x=>x.id===id);
   if(!n)return;
-  if(!confirm('Supprimer '+(n.label||n.name)+' de la liste ?'))return;
+  const nodeTitle=n.label||n.type||n.name||('Node '+id);
+  if(!confirm('Supprimer '+nodeTitle+' de la liste ?'))return;
   try{
     const r=await fetch('/api/nodes/delete?id='+encodeURIComponent(id),{method:'POST'});
-    const d=await r.json();
-    toast(r.ok?d.message:d.error,r.ok);
+    const d=await parseJsonResponse(r);
+    toast(r.ok?(d.message||'Appareil supprime'):(d.error||'Erreur suppression'),r.ok);
     if(r.ok)loadNodes();
-  }catch(e){toast('Erreur reseau',false);}
+  }catch(e){toast(String(e&&e.message?e.message:'Erreur reseau'),false);}
 }
 
 let _tt;
@@ -1199,7 +1516,8 @@ void saveNodes() {
     stored_node_t sn = {};
     sn.id = nodes[i].id;
     memcpy(sn.mac, nodes[i].mac, 6);
-    strncpy(sn.name, nodes[i].name, 31);
+    strncpy(sn.nodeName, nodes[i].nodeName, 31);
+    strncpy(sn.typeName, nodes[i].typeName, 31);
     prefs.putBytes(key, &sn, sizeof(sn));
     nodes[i].persisted = true;
 
@@ -1244,8 +1562,10 @@ void loadNodes() {
     if (prefs.getBytes(key, &sn, sizeof(sn)) == sizeof(sn)) {
       nodes[i].id = sn.id;
       memcpy(nodes[i].mac, sn.mac, 6);
-      strncpy(nodes[i].name, sn.name, 31);
-      nodes[i].name[31] = 0;
+      strncpy(nodes[i].nodeName, sn.nodeName, 31);
+      nodes[i].nodeName[31] = 0;
+      strncpy(nodes[i].typeName, sn.typeName, 31);
+      nodes[i].typeName[31] = 0;
       nodes[i].lastSeen = 0;
       nodes[i].active = false;
       nodes[i].persisted = true;
@@ -1382,8 +1702,8 @@ uint8_t nextFreeNodeId(uint8_t preferred) {
 int upsertNode(const uint8_t* mac, const char* name, uint8_t id) {
   int idx = findNodeByMac(mac);
   if (idx >= 0) {
-    strncpy(nodes[idx].name, name, 31);
-    nodes[idx].name[31] = 0;
+    strncpy(nodes[idx].nodeName, name, 31);
+    nodes[idx].nodeName[31] = 0;
     nodes[idx].lastSeen = millis();
     nodes[idx].active = true;
     return idx;
@@ -1394,8 +1714,8 @@ int upsertNode(const uint8_t* mac, const char* name, uint8_t id) {
   idx = nodeCount++;
   nodes[idx].id = assignedId;
   memcpy(nodes[idx].mac, mac, 6);
-  strncpy(nodes[idx].name, name, 31);
-  nodes[idx].name[31] = 0;
+  strncpy(nodes[idx].nodeName, name, 31);
+  nodes[idx].nodeName[31] = 0;
   nodes[idx].lastSeen = millis();
   nodes[idx].active = true;
   nodes[idx].persisted   = false;
@@ -1430,6 +1750,7 @@ int upsertNode(const uint8_t* mac, const char* name, uint8_t id) {
 }
 
 void clearPending();
+void startScan();
 
 bool deleteNodeById(uint8_t id) {
   int idx = findNodeBySelfId(id);
@@ -1504,6 +1825,33 @@ void sendLocalBalanceCmdToNode(int idx, const char* cmd) {
   sendMsg(nodes[idx].mac, MSG_COMMAND, cmd);
 }
 
+static bool sendBalanceCmdAndWait(int idx, const char* cmd, char* out, size_t outSize, unsigned long timeoutMs) {
+  if (out && outSize) out[0] = 0;
+  if (idx < 0 || idx >= nodeCount || !nodes[idx].active || !cmd || !*cmd) return false;
+  apiBalanceReplyPending = true;
+  apiBalanceReplyReady = false;
+  apiBalanceReplyNodeId = nodes[idx].id;
+  apiBalanceReply[0] = 0;
+  sendLocalBalanceCmdToNode(idx, cmd);
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    delay(10);
+    if (apiBalanceReplyReady) {
+      if (out && outSize) {
+        strlcpy(out, apiBalanceReply, outSize);
+      }
+      apiBalanceReplyPending = false;
+      apiBalanceReplyReady = false;
+      apiBalanceReply[0] = 0;
+      return true;
+    }
+  }
+  apiBalanceReplyPending = false;
+  apiBalanceReplyReady = false;
+  apiBalanceReply[0] = 0;
+  return false;
+}
+
 void sendPingToNode(int idx) {
   sendMsg(nodes[idx].mac, MSG_PING, "");
   startPending(PEND_PING, idx, true);
@@ -1519,10 +1867,12 @@ void sendConfigReqToNode(int idx) {
 }
 
 void sendConfigSetToNode(int idx) {
-  char buf[200];
-  StaticJsonDocument<256> doc;
+  normalizeNodeIdentity(idx);
+  char buf[256];
+  StaticJsonDocument<384> doc;
   uint8_t b = nodes[idx].brand < 3 ? nodes[idx].brand : 0;
-  doc["n"] = nodes[idx].name;
+  doc["n"] = nodes[idx].nodeName;
+  doc["tn"] = nodes[idx].typeName;
   doc["br"] = b;
   doc["bd"] = nodes[idx].baud;
   doc["pa"] = nodes[idx].parity;
@@ -1537,6 +1887,10 @@ void sendConfigSetToNode(int idx) {
   doc["zc"] = nodes[idx].zeroCmd[0] ? nodes[idx].zeroCmd : "Z";
   doc["cp"] = nodes[idx].capacity > 0 ? nodes[idx].capacity : 5000.0f;
   doc["rs"] = nodes[idx].resolution > 0 ? nodes[idx].resolution : 0.01f;
+  doc["pr"] = protocolForBrand(b);
+  doc["en"] = lineEndingForBrand(b);
+  doc["cf"] = 100;
+  doc["as"] = 0;
   serializeJson(doc, buf, sizeof(buf));
   sendMsg(nodes[idx].mac, MSG_CONFIG_SET, buf);
 }
@@ -1633,6 +1987,54 @@ bool extractClientBalanceId(const char* raw, char* out, size_t outSize) {
   return false;
 }
 
+static bool extractQuotedValue(const char* raw, char* out, size_t outSize) {
+  if (!raw || !out || outSize < 2) return false;
+  const char* first = strchr(raw, '"');
+  if (!first) return false;
+  first++;
+  const char* second = strchr(first, '"');
+  if (!second || second <= first) return false;
+  size_t len = (size_t)(second - first);
+  if (len >= outSize) len = outSize - 1;
+  memcpy(out, first, len);
+  out[len] = 0;
+  return len > 0;
+}
+
+static bool parseBalanceIdFromReply(uint8_t brand, const char* raw, char* out, size_t outSize) {
+  if (!raw || !out || outSize < 3) return false;
+  out[0] = 0;
+  if (brand == BRAND_METTLER) {
+    char quoted[32];
+    if (extractQuotedValue(raw, quoted, sizeof(quoted)) &&
+        extractClientBalanceId(quoted, out, outSize)) return true;
+  }
+  return extractClientBalanceId(raw, out, outSize);
+}
+
+static uint8_t protocolForBrand(uint8_t brand) {
+  switch (brand) {
+    case BRAND_AD: return PROTOCOL_AD;
+    case BRAND_METTLER: return PROTOCOL_SICS;
+    case BRAND_SARTORIUS: return PROTOCOL_SARTORIUS_SBI;
+    default: return PROTOCOL_UNKNOWN;
+  }
+}
+
+static uint8_t lineEndingForBrand(uint8_t) {
+  return LINE_ENDING_CRLF;
+}
+
+static void normalizeNodeIdentity(int idx) {
+  if (idx < 0 || idx >= nodeCount) return;
+  char parsedId[20];
+  if (extractClientBalanceId(nodes[idx].displayLabel, parsedId, sizeof(parsedId)) ||
+      extractClientBalanceId(nodes[idx].balanceId, parsedId, sizeof(parsedId))) {
+    strlcpy(nodes[idx].balanceId, parsedId, sizeof(nodes[idx].balanceId));
+    setNodeDisplayLabel(idx);
+  }
+}
+
 void setNodeDisplayLabel(int idx) {
   if (idx < 0 || idx >= nodeCount) return;
   if (isKnownBalanceId(nodes[idx].balanceId)) {
@@ -1658,7 +2060,7 @@ bool nodeMatchesProfile(int idx, const stored_profile_t& p) {
   if (idx < 0 || idx >= nodeCount) return false;
   const node_entry_t& n = nodes[idx];
   return strcmp(n.displayLabel, p.label) == 0 &&
-         strcmp(n.name, p.typeName) == 0 &&
+         strcmp(n.typeName, p.typeName) == 0 &&
          n.brand == p.brand &&
          n.baud == p.baud &&
          n.parity == p.parity &&
@@ -1681,7 +2083,7 @@ bool applyProfileToNode(int nodeIdx, int profileIdx) {
   if (extractClientBalanceId(p.label, nodes[nodeIdx].balanceId, sizeof(nodes[nodeIdx].balanceId))) {
     setNodeDisplayLabel(nodeIdx);
   }
-  strlcpy(nodes[nodeIdx].name, p.typeName, sizeof(nodes[nodeIdx].name));
+  strlcpy(nodes[nodeIdx].typeName, p.typeName, sizeof(nodes[nodeIdx].typeName));
   nodes[nodeIdx].brand = p.brand;
   nodes[nodeIdx].baud = p.baud;
   nodes[nodeIdx].parity = p.parity;
@@ -1720,7 +2122,12 @@ void applyClientBrandMapping(int idx) {
 
 const char* nodeDisplayName(int idx) {
   if (idx >= 0 && idx < nodeCount && nodes[idx].displayLabel[0]) return nodes[idx].displayLabel;
-  if (idx >= 0 && idx < nodeCount) return nodes[idx].name;
+  if (idx >= 0 && idx < nodeCount) return nodes[idx].nodeName;
+  return "";
+}
+
+const char* nodeBalanceType(int idx) {
+  if (idx >= 0 && idx < nodeCount && nodes[idx].typeName[0]) return nodes[idx].typeName;
   return "";
 }
 
@@ -1747,18 +2154,22 @@ static void appendJsonEscaped(String& out, const char* value) {
   out += '"';
   if (value) {
     for (size_t i = 0; value[i]; i++) {
-      char c = value[i];
+      uint8_t c = (uint8_t)value[i];
       if (c == '"' || c == '\\') {
         out += '\\';
-        out += c;
+        out += (char)c;
       } else if (c == '\n') {
         out += "\\n";
       } else if (c == '\r') {
         out += "\\r";
       } else if (c == '\t') {
         out += "\\t";
+      } else if (c < 0x20) {
+        char hex[7];
+        snprintf(hex, sizeof(hex), "\\u%04X", c);
+        out += hex;
       } else {
-        out += c;
+        out += (char)c;
       }
     }
   }
@@ -1773,10 +2184,13 @@ void handleRoot() {
 }
 
 void handleApiNodes() {
-  String body;
-  body.reserve(8192);
-  body += '[';
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "application/json", "");
+  webServer.sendContent("[");
   for (int i = 0; i < nodeCount; i++) {
+    String body;
+    body.reserve(768);
     if (i > 0) body += ',';
     char mac[18];
     snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -1788,7 +2202,9 @@ void handleApiNodes() {
     body += ",\"mac\":";
     appendJsonEscaped(body, mac);
     body += ",\"name\":";
-    appendJsonEscaped(body, nodes[i].name);
+    appendJsonEscaped(body, nodes[i].nodeName);
+    body += ",\"type\":";
+    appendJsonEscaped(body, nodes[i].typeName);
     body += ",\"label\":";
     appendJsonEscaped(body, nodes[i].displayLabel);
     body += ",\"balanceId\":";
@@ -1801,12 +2217,14 @@ void handleApiNodes() {
     body += nodes[i].configKnown ? "true" : "false";
     if (nodes[i].configKnown) {
       uint8_t b = nodes[i].brand < 3 ? nodes[i].brand : 0;
-      body += ",\"config\":{\"brand\":";
-      body += String(nodes[i].brand);
-      body += ",\"brandName\":";
-      appendJsonEscaped(body, BRAND_NAMES[b]);
-      body += ",\"baud\":";
-      body += String(nodes[i].baud);
+    body += ",\"config\":{\"brand\":";
+    body += String(nodes[i].brand);
+    body += ",\"brandName\":";
+    appendJsonEscaped(body, BRAND_NAMES[b]);
+    body += ",\"firmware\":";
+    appendJsonEscaped(body, nodes[i].firmwareVariant);
+    body += ",\"baud\":";
+    body += String(nodes[i].baud);
       body += ",\"parity\":";
       body += String(nodes[i].parity);
       body += ",\"dataBits\":";
@@ -1829,13 +2247,15 @@ void handleApiNodes() {
       body += String(nodes[i].capacity > 0 ? nodes[i].capacity : 5000.0f, 4);
       body += ",\"resolution\":";
       body += String(nodes[i].resolution > 0 ? nodes[i].resolution : 0.01f, 4);
+      body += ",\"protocol\":";
+      body += String(protocolForBrand(nodes[i].brand));
       body += '}';
     }
     body += '}';
+    webServer.sendContent(body);
   }
-  body += ']';
-  webServer.sendHeader("Access-Control-Allow-Origin", "*");
-  webServer.send(200, "application/json", body);
+  webServer.sendContent("]");
+  webServer.sendContent("");
 }
 
 void handleApiConfigSet() {
@@ -1873,7 +2293,18 @@ void handleApiConfigSet() {
       nodes[idx].balanceId[0] = 0;
     }
   }
-  if (doc.containsKey("name"))        strlcpy(nodes[idx].name, doc["name"], sizeof(nodes[idx].name));
+  if (doc.containsKey("balanceId")) {
+    char rawBalanceId[20];
+    strlcpy(rawBalanceId, doc["balanceId"] | "", sizeof(rawBalanceId));
+    if (extractClientBalanceId(rawBalanceId, nodes[idx].balanceId, sizeof(nodes[idx].balanceId))) {
+      setNodeDisplayLabel(idx);
+    } else if (rawBalanceId[0]) {
+      strlcpy(nodes[idx].balanceId, rawBalanceId, sizeof(nodes[idx].balanceId));
+      setNodeDisplayLabel(idx);
+    }
+  }
+  if (doc.containsKey("nodeName"))    strlcpy(nodes[idx].nodeName, doc["nodeName"], sizeof(nodes[idx].nodeName));
+  if (doc.containsKey("name"))        strlcpy(nodes[idx].typeName, doc["name"], sizeof(nodes[idx].typeName));
   if (doc.containsKey("brand"))       nodes[idx].brand     = doc["brand"];
   if (doc.containsKey("baud"))        nodes[idx].baud      = doc["baud"];
   if (doc.containsKey("parity"))      nodes[idx].parity    = doc["parity"];
@@ -1890,6 +2321,7 @@ void handleApiConfigSet() {
   if (!nodes[idx].zeroCmd[0])         strlcpy(nodes[idx].zeroCmd, "Z", sizeof(nodes[idx].zeroCmd));
   if (nodes[idx].capacity <= 0)       nodes[idx].capacity = 5000.0f;
   if (nodes[idx].resolution <= 0)     nodes[idx].resolution = 0.01f;
+  normalizeNodeIdentity(idx);
   nodes[idx].configKnown = true;
 
   sendConfigSetToNode(idx);
@@ -1899,6 +2331,106 @@ void handleApiConfigSet() {
     nodes[idx].id, nodes[idx].brand, nodes[idx].baud);
   webServer.send(200, "application/json",
     "{\"status\":\"ok\",\"message\":\"Config envoyee, node redemarrage...\"}");
+}
+
+void handleApiBalanceIdSet() {
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!webServer.hasArg("plain")) {
+    webServer.send(400, "application/json", "{\"error\":\"no body\"}");
+    return;
+  }
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, webServer.arg("plain")) != DeserializationError::Ok) {
+    webServer.send(400, "application/json", "{\"error\":\"json_parse\"}");
+    return;
+  }
+  int id = doc["id"] | -1;
+  const char* requested = doc["balanceId"] | "";
+  if (id < 1 || id > 254) {
+    webServer.send(400, "application/json", "{\"error\":\"invalid_id\"}");
+    return;
+  }
+  int idx = findNodeBySelfId((uint8_t)id);
+  if (idx < 0) {
+    webServer.send(404, "application/json", "{\"error\":\"node_not_found\"}");
+    return;
+  }
+  if (!nodes[idx].active) {
+    webServer.send(400, "application/json", "{\"error\":\"node_offline\"}");
+    return;
+  }
+  char balanceId[20] = "";
+  if (!extractClientBalanceId(requested, balanceId, sizeof(balanceId))) {
+    webServer.send(400, "application/json", "{\"error\":\"invalid_balance_id\"}");
+    return;
+  }
+  if (nodes[idx].brand != BRAND_METTLER) {
+    webServer.send(400, "application/json", "{\"error\":\"mettler_only\"}");
+    return;
+  }
+
+  char cmd[24];
+  snprintf(cmd, sizeof(cmd), "I10 \"%s\"", balanceId);
+  sendLocalBalanceCmdToNode(idx, cmd);
+  strlcpy(nodes[idx].balanceId, balanceId, sizeof(nodes[idx].balanceId));
+  setNodeDisplayLabel(idx);
+  saveNodes();
+  hubLogPrintf("@%02u BALANCE_ID_SET %s\n", nodes[idx].id, balanceId);
+  webServer.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"ID balance programme\"}");
+}
+
+void handleApiBalanceIdRead() {
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!webServer.hasArg("plain")) {
+    webServer.send(400, "application/json", "{\"error\":\"no body\"}");
+    return;
+  }
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, webServer.arg("plain")) != DeserializationError::Ok) {
+    webServer.send(400, "application/json", "{\"error\":\"json_parse\"}");
+    return;
+  }
+  int id = doc["id"] | -1;
+  if (id < 1 || id > 254) {
+    webServer.send(400, "application/json", "{\"error\":\"invalid_id\"}");
+    return;
+  }
+  int idx = findNodeBySelfId((uint8_t)id);
+  if (idx < 0) {
+    webServer.send(404, "application/json", "{\"error\":\"node_not_found\"}");
+    return;
+  }
+  if (!nodes[idx].active) {
+    webServer.send(400, "application/json", "{\"error\":\"node_offline\"}");
+    return;
+  }
+  uint8_t brand = doc["brand"] | nodes[idx].brand;
+  const char* cmd = "";
+  if (brand == BRAND_AD) cmd = "?ID";
+  else if (brand == BRAND_METTLER) cmd = "I10";
+  else {
+    webServer.send(400, "application/json", "{\"error\":\"brand_not_supported\"}");
+    return;
+  }
+
+  char raw[128];
+  if (!sendBalanceCmdAndWait(idx, cmd, raw, sizeof(raw), 1800)) {
+    webServer.send(504, "application/json", "{\"error\":\"read_timeout\"}");
+    return;
+  }
+  char balanceId[20] = "";
+  bool ok = parseBalanceIdFromReply(brand, raw, balanceId, sizeof(balanceId));
+  if (ok) {
+    strlcpy(nodes[idx].balanceId, balanceId, sizeof(nodes[idx].balanceId));
+    setNodeDisplayLabel(idx);
+    saveNodes();
+  }
+  String body = "{\"status\":\"ok\",\"message\":\"ID lu\",\"raw\":";
+  appendJsonEscaped(body, raw);
+  body += ",\"balanceId\":";
+  appendJsonEscaped(body, ok ? balanceId : "");
+  body += "}";
+  webServer.send(200, "application/json", body);
 }
 
 void handleApiNodeDelete() {
@@ -1927,6 +2459,28 @@ void handleApiNodeDelete() {
   }
   hubLogPrintf("@%02u NODE_DELETED\n", id);
   webServer.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Appareil supprime\"}");
+}
+
+void handleApiScanStart() {
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  startScan();
+  webServer.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Recherche des nodes lancee\"}");
+}
+
+void handleApiPurge() {
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  int remoteResetCount = 0;
+  for (int i = 0; i < nodeCount; i++) {
+    if (!nodes[i].active) continue;
+    sendMsg(nodes[i].mac, MSG_PURGE_RESET, "purge");
+    remoteResetCount++;
+    delay(25);
+  }
+  clearNodes();
+  String body = "{\"status\":\"ok\",\"message\":\"Purge terminee\",\"remoteResetCount\":";
+  body += String(remoteResetCount);
+  body += "}";
+  webServer.send(200, "application/json", body);
 }
 
 void handleApiSettings() {
@@ -1958,15 +2512,22 @@ void handleApiSettingsSet() {
 }
 
 void handleApiProfiles() {
-  String body;
-  body.reserve(8192);
-  body += '[';
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  webServer.send(200, "application/json", "");
+  webServer.sendContent("[");
   for (int i = 0; i < profileCount; i++) {
+    String body;
+    body.reserve(512);
     if (i > 0) body += ',';
+    char profileBalanceId[20] = "";
+    extractClientBalanceId(profiles[i].label, profileBalanceId, sizeof(profileBalanceId));
     body += "{\"name\":";
     appendJsonEscaped(body, profiles[i].profileName);
     body += ",\"label\":";
     appendJsonEscaped(body, profiles[i].label);
+    body += ",\"balanceId\":";
+    appendJsonEscaped(body, profileBalanceId);
     body += ",\"type\":";
     appendJsonEscaped(body, profiles[i].typeName);
     body += ",\"brand\":";
@@ -1997,11 +2558,13 @@ void handleApiProfiles() {
     body += String(profiles[i].capacity, 4);
     body += ",\"resolution\":";
     body += String(profiles[i].resolution, 4);
+    body += ",\"protocol\":";
+    body += String(protocolForBrand(profiles[i].brand));
     body += '}';
+    webServer.sendContent(body);
   }
-  body += ']';
-  webServer.sendHeader("Access-Control-Allow-Origin", "*");
-  webServer.send(200, "application/json", body);
+  webServer.sendContent("]");
+  webServer.sendContent("");
 }
 
 void handleApiProfilesSave() {
@@ -2030,7 +2593,16 @@ void handleApiProfilesSave() {
     memset(&profiles[idx], 0, sizeof(profiles[idx]));
   }
   strlcpy(profiles[idx].profileName, profileName, sizeof(profiles[idx].profileName));
-  strlcpy(profiles[idx].label, doc["label"] | "", sizeof(profiles[idx].label));
+  char rawLabel[32];
+  strlcpy(rawLabel, doc["label"] | "", sizeof(rawLabel));
+  char rawBalanceId[20];
+  strlcpy(rawBalanceId, doc["balanceId"] | "", sizeof(rawBalanceId));
+  char parsedBalanceId[20] = "";
+  if (extractClientBalanceId(rawBalanceId, parsedBalanceId, sizeof(parsedBalanceId)) || extractClientBalanceId(rawLabel, parsedBalanceId, sizeof(parsedBalanceId))) {
+    snprintf(profiles[idx].label, sizeof(profiles[idx].label), "CDO %s", parsedBalanceId);
+  } else {
+    strlcpy(profiles[idx].label, rawLabel, sizeof(profiles[idx].label));
+  }
   strlcpy(profiles[idx].typeName, doc["name"] | "", sizeof(profiles[idx].typeName));
   profiles[idx].brand = doc["brand"] | 0;
   profiles[idx].baud = doc["baud"] | 2400;
@@ -2087,7 +2659,6 @@ void handleApiProfilesApply() {
     webServer.send(404, "application/json", "{\"error\":\"profile_not_found\"}");
     return;
   }
-  stored_profile_t& p = profiles[profileIdx];
   applyProfileToNode(nodeIdx, profileIdx);
   webServer.send(200, "application/json", "{\"status\":\"ok\"}");
 }
@@ -2136,7 +2707,7 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
     case MSG_ANNOUNCE: {
       int idx = upsertNode(info->src_addr, m.payload, m.nodeId);
       if (idx >= 0) {
-        hubLogPrintf("@00 FOUND id=%u name=%s\n", m.nodeId, nodes[idx].name);
+        hubLogPrintf("@00 FOUND id=%u name=%s\n", m.nodeId, nodes[idx].nodeName);
         displayDirty = true;
         sendConfigReqToNode(idx);  // demande config à chaque announce
         sendInfoReqToNode(idx);
@@ -2151,6 +2722,10 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
       nodes[idx].active = true;
       bool isError = (strncmp(m.payload, "ERROR", 5) == 0);
       bool matchesPending = (pending.kind == PEND_BALANCE && memcmp(pending.mac, info->src_addr, 6) == 0);
+      if (apiBalanceReplyPending && nodes[idx].id == apiBalanceReplyNodeId) {
+        strlcpy(apiBalanceReply, m.payload, sizeof(apiBalanceReply));
+        apiBalanceReplyReady = true;
+      }
       if (matchesPending && pendingToPc) {
         if (isError) Serial.printf("@%02u %s\n", nodes[idx].id, m.payload);
         else Serial.printf("@%02u RX %s\n", nodes[idx].id, m.payload);
@@ -2236,6 +2811,9 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
           identityChanged = true;
         }
       }
+      if (extractQuotedField(m.payload, "fw", tmp, sizeof(tmp))) {
+        strlcpy(nodes[idx].firmwareVariant, tmp, sizeof(nodes[idx].firmwareVariant));
+      }
       if (identityChanged) saveNodes();
       if (autoApplyProfileForNode(idx)) {
         displayDirty = true;
@@ -2277,7 +2855,8 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
       if (idx < 0) break;
       StaticJsonDocument<256> doc;
       if (deserializeJson(doc, m.payload) == DeserializationError::Ok) {
-        strlcpy(nodes[idx].name, doc["n"] | nodes[idx].name, sizeof(nodes[idx].name));
+        strlcpy(nodes[idx].nodeName, doc["n"] | nodes[idx].nodeName, sizeof(nodes[idx].nodeName));
+        strlcpy(nodes[idx].typeName, doc["tn"] | nodes[idx].typeName, sizeof(nodes[idx].typeName));
         nodes[idx].brand       = doc["br"] | 0;
         nodes[idx].baud        = doc["bd"] | 2400;
         nodes[idx].parity      = doc["pa"] | 1;
@@ -2291,6 +2870,7 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
         strlcpy(nodes[idx].zeroCmd, doc["zc"] | doc["zero"] | "Z", sizeof(nodes[idx].zeroCmd));
         nodes[idx].capacity    = doc["cp"] | doc["cap"] | 5000.0f;
         nodes[idx].resolution  = doc["rs"] | doc["res"] | 0.01f;
+        strlcpy(nodes[idx].firmwareVariant, doc["fv"] | "", sizeof(nodes[idx].firmwareVariant));
         if (nodes[idx].capacity <= 0) nodes[idx].capacity = 5000.0f;
         if (nodes[idx].resolution <= 0) nodes[idx].resolution = 0.01f;
         nodes[idx].configKnown = true;
@@ -2379,8 +2959,8 @@ void processSerialCommand(char* cmd) {
       Serial.printf("@00 LIST count=%d\n", nodeCount);
       for (int i = 0; i < nodeCount; i++) {
         unsigned long ago = nodes[i].lastSeen ? (millis() - nodes[i].lastSeen) / 1000UL : 0;
-        Serial.printf("@%02u name=%s status=%s age=%lus\n",
-          nodes[i].id, nodes[i].name,
+        Serial.printf("@%02u node=%s status=%s age=%lus\n",
+          nodes[i].id, nodes[i].nodeName,
           nodes[i].active ? "online" : "offline", ago);
       }
     } else if (strcmp(rest, "CLEAR") == 0) {
@@ -2570,8 +3150,6 @@ static lv_obj_t* addRoundPanel(lv_obj_t* parent, int x, int y, int w, int h) {
   return card;
 }
 
-static float parseWeightValue(const char* raw);
-
 static void selectNodeIndex(int idx) {
   if (idx < 0 || idx >= nodeCount) return;
   listAnimFrom = -1;
@@ -2584,11 +3162,16 @@ static void selectNodeIndex(int idx) {
   uiState = STATE_CONNECTED;
   displayDirty = true;
   if (!nodes[idx].persisted) saveNodes();
-  hubLogPrintf("@%02u SELECTED %s\n", nodes[idx].id, nodes[idx].name);
+  hubLogPrintf("@%02u SELECTED %s\n", nodes[idx].id, nodes[idx].nodeName);
 }
 
 static void uiEvtStartScan(lv_event_t*) {
   startScan();
+}
+
+static void uiEvtOpenWifiQr(lv_event_t*) {
+  uiState = STATE_WIFI_QR;
+  displayDirty = true;
 }
 
 static void uiEvtSelectNode(lv_event_t* e) {
@@ -2621,7 +3204,12 @@ static void uiEvtHome(lv_event_t*) {
   selectedNode = -1;
   lastValue[0] = 0;
   lastStatus[0] = 0;
-  uiState = STATE_IDLE;
+  uiState = STATE_LIST;
+  displayDirty = true;
+}
+
+static void uiEvtCloseWifiQr(lv_event_t*) {
+  uiState = STATE_LIST;
   displayDirty = true;
 }
 
@@ -2873,8 +3461,67 @@ static const char* currentDeviceName() {
 }
 
 static const char* nodeConfiguredName(int idx) {
-  if (idx >= 0 && idx < nodeCount && nodes[idx].name[0]) return nodes[idx].name;
+  if (idx >= 0 && idx < nodeCount && nodes[idx].typeName[0]) return nodes[idx].typeName;
   return "";
+}
+
+static void buildWifiQrPayload(char* out, size_t outSize) {
+  if (!out || outSize == 0) return;
+  snprintf(out, outSize, "WIFI:T:WPA;S:%s;P:%s;;", apSsid, AP_PASS);
+}
+
+static bool addWifiQrCode(lv_obj_t* parent, const char* payload, int x, int y, int targetSize) {
+  static uint8_t qrData[qrcodegen_BUFFER_LEN_FOR_VERSION(8)];
+  static uint8_t tempData[qrcodegen_BUFFER_LEN_FOR_VERSION(8)];
+  static lv_color_t qrCanvasBuf[176 * 176];
+  if (!qrcodegen_encodeText(payload, tempData, qrData, qrcodegen_Ecc_MEDIUM, 1, 8, qrcodegen_Mask_AUTO, true)) {
+    return false;
+  }
+
+  const int qrSize = qrcodegen_getSize(qrData);
+  const int quietZone = 2;
+  const int modulePx = max(3, targetSize / (qrSize + quietZone * 2));
+  const int fullSize = (qrSize + quietZone * 2) * modulePx;
+
+  if (fullSize > 176) return false;
+
+  int parentW = lv_obj_get_width(parent);
+  int parentH = lv_obj_get_height(parent);
+  int posX = x;
+  int posY = y;
+  if (parentW > fullSize) posX = (parentW - fullSize) / 2;
+  if (parentH > fullSize) posY = (parentH - fullSize) / 2;
+
+  lv_obj_t* frame = lv_obj_create(parent);
+  lv_obj_remove_style_all(frame);
+  lv_obj_set_size(frame, fullSize, fullSize);
+  lv_obj_set_pos(frame, posX, posY);
+  lv_obj_set_style_radius(frame, 0, 0);
+  lv_obj_set_style_bg_opa(frame, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(frame, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_border_width(frame, 0, 0);
+  lv_obj_clear_flag(frame, LV_OBJ_FLAG_CLICKABLE);
+
+  lv_obj_t* canvas = lv_canvas_create(frame);
+  lv_canvas_set_buffer(canvas, qrCanvasBuf, fullSize, fullSize, LV_IMG_CF_TRUE_COLOR);
+  lv_obj_set_pos(canvas, 0, 0);
+  lv_obj_clear_flag(canvas, LV_OBJ_FLAG_CLICKABLE);
+  lv_canvas_fill_bg(canvas, lv_color_hex(0xFFFFFF), LV_OPA_COVER);
+
+  for (int yy = 0; yy < qrSize; ++yy) {
+    for (int xx = 0; xx < qrSize; ++xx) {
+      lv_color_t color = qrcodegen_getModule(qrData, xx, yy) ? lv_color_hex(0x101820) : lv_color_hex(0xFFFFFF);
+      const int startX = (xx + quietZone) * modulePx;
+      const int startY = (yy + quietZone) * modulePx;
+      for (int py = 0; py < modulePx; ++py) {
+        for (int px = 0; px < modulePx; ++px) {
+          lv_canvas_set_px_color(canvas, startX + px, startY + py, color);
+        }
+      }
+    }
+  }
+
+  return true;
 }
 
 static void addHeaderBackButton(lv_obj_t* scr, lv_event_cb_t cb) {
@@ -2945,6 +3592,29 @@ static void uiRenderIdle(lv_obj_t* scr) {
   addCenteredText(scr, apSsid, UI_CX, 158, &lv_font_montserrat_14, C_MUTED);
   addCenteredText(scr, apIp, UI_CX, 180, &lv_font_montserrat_20, C_BLUE);
   addPillButton(scr, 60, 278, 240, 44, "Rechercher", uiEvtStartScan, NULL, flashBtnIdx == 2, 2, 1);
+  addHeaderActionButton(scr, "QR", uiEvtOpenWifiQr, flashBtnIdx == 3, 3, 1);
+}
+
+static void uiRenderWifiQr(lv_obj_t* scr) {
+  addHeaderBackButton(scr, uiEvtCloseWifiQr);
+
+  lv_obj_t* card = lv_obj_create(scr);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, 188, 188);
+  lv_obj_set_pos(card, 86, 96);
+  lv_obj_set_style_radius(card, 18, 0);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(card, lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_border_width(card, 0, 0);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+  char qrPayload[96];
+  buildWifiQrPayload(qrPayload, sizeof(qrPayload));
+  if (!addWifiQrCode(card, qrPayload, 6, 6, 176)) {
+    addCenteredText(card, "QR indisponible", 94, 76, &lv_font_montserrat_20, lv_color_hex(0x07101C));
+  }
+
+  addCenteredText(scr, apIp, UI_CX, 310, &lv_font_montserrat_14, C_MUTED);
 }
 
 static void uiRenderScanning(lv_obj_t* scr) {
@@ -2981,7 +3651,7 @@ static void uiRenderScanning(lv_obj_t* scr) {
 }
 
 static void uiRenderList(lv_obj_t* scr) {
-  addHeaderBackButton(scr, uiEvtHome);
+  addIconButton(scr, 58, 50, 44, "QR", uiEvtOpenWifiQr, NULL, flashBtnIdx == 3, 3, 1, LV_EVENT_PRESSED);
   addCenteredText(scr, "Appareils", UI_CX, 46, &lv_font_montserrat_24, C_TEXT);
   char sub[32];
   snprintf(sub, sizeof(sub), "%d/%d en ligne", activeNodeCount(), nodeCount);
@@ -3081,6 +3751,7 @@ void renderDisplay() {
     case STATE_SCANNING:  uiRenderScanning(scr);  break;
     case STATE_LIST:      uiRenderList(scr);      break;
     case STATE_CONNECTED: uiRenderConnected(scr); break;
+    case STATE_WIFI_QR:   uiRenderWifiQr(scr);    break;
   }
   lcd_lvgl_unlock();
 }
@@ -3116,7 +3787,8 @@ void handleEncoder() {
   if (!sw && lastSw && millis() - lastBtnAt > 220) {
     lastBtnAt = millis();
     if (uiState == STATE_IDLE) {
-      startScan();
+      uiState = STATE_LIST;
+      displayDirty = true;
     } else if (uiState == STATE_LIST && nodeCount > 0) {
       selectNodeIndex(listScroll);
     } else if (uiState == STATE_CONNECTED) {
@@ -3126,7 +3798,9 @@ void handleEncoder() {
       uiState = STATE_LIST;
       displayDirty = true;
     } else if (uiState == STATE_LIST) {
-      uiState = STATE_IDLE;
+      startScan();
+    } else if (uiState == STATE_WIFI_QR) {
+      uiState = STATE_LIST;
       displayDirty = true;
     }
   }
@@ -3178,8 +3852,16 @@ void setup() {
   webServer.on("/api/nodes",    HTTP_OPTIONS, handleApiOptions);
   webServer.on("/api/nodes/delete", HTTP_POST, handleApiNodeDelete);
   webServer.on("/api/nodes/delete", HTTP_OPTIONS, handleApiOptions);
+  webServer.on("/api/scan", HTTP_POST, handleApiScanStart);
+  webServer.on("/api/scan", HTTP_OPTIONS, handleApiOptions);
+  webServer.on("/api/purge", HTTP_POST, handleApiPurge);
+  webServer.on("/api/purge", HTTP_OPTIONS, handleApiOptions);
   webServer.on("/api/config",   HTTP_POST,    handleApiConfigSet);
   webServer.on("/api/config",   HTTP_OPTIONS, handleApiOptions);
+  webServer.on("/api/balance-id", HTTP_POST, handleApiBalanceIdSet);
+  webServer.on("/api/balance-id", HTTP_OPTIONS, handleApiOptions);
+  webServer.on("/api/balance-id/read", HTTP_POST, handleApiBalanceIdRead);
+  webServer.on("/api/balance-id/read", HTTP_OPTIONS, handleApiOptions);
   webServer.on("/api/profiles", HTTP_GET,     handleApiProfiles);
   webServer.on("/api/profiles", HTTP_POST,    handleApiProfilesSave);
   webServer.on("/api/profiles", HTTP_DELETE,  handleApiProfilesDelete);

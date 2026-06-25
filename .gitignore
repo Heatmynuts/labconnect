@@ -1,0 +1,8 @@
+.DS_Store
+node_modules/
+**/tsconfig.tsbuildinfo
+LabConnect Hub/round-hub/_codex_attempt_backup/
+apps/**/dist/
+apps/**/node_modules/
+apps/**/src-tauri/target/
+apps/**/src-tauri/gen/

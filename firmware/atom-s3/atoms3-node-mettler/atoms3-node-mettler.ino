@@ -42,11 +42,11 @@
 #define BRAND_UNKNOWN   255
 
 #ifndef FW_VARIANT_CODE
-#define FW_VARIANT_CODE "ATOM_GENERIC"
+#define FW_VARIANT_CODE "ATOM_METTLER"
 #endif
 
 #ifndef FW_LOCK_SERIAL_DEFAULTS
-#define FW_LOCK_SERIAL_DEFAULTS 0
+#define FW_LOCK_SERIAL_DEFAULTS 1
 #endif
 
 enum BalanceProtocol : uint8_t {
@@ -116,17 +116,17 @@ static_assert(sizeof(msg_t) == 208, "msg_t must be 208 bytes");
 // Config par défaut (fallback si NVS vide)
 // =====================================================
 #define DEFAULT_NODE_ID      1
-#define DEFAULT_NODE_NAME    "BAL-01"
-#define DEFAULT_BRAND        BRAND_AD
-#define DEFAULT_BAUD         2400
-#define DEFAULT_PARITY       1        // Even
-#define DEFAULT_DATABITS     7
+#define DEFAULT_NODE_NAME    "ATOM-METTLER"
+#define DEFAULT_BRAND        BRAND_METTLER
+#define DEFAULT_BAUD         9600
+#define DEFAULT_PARITY       0        // None
+#define DEFAULT_DATABITS     8
 #define DEFAULT_STOPBITS     1
 #define DEFAULT_RX           5
 #define DEFAULT_TX           6
 #define DEFAULT_SWAP         false
-#define DEFAULT_POLL_CMD     "Q"
-#define DEFAULT_LINE_TIMEOUT 300
+#define DEFAULT_POLL_CMD     "SI"
+#define DEFAULT_LINE_TIMEOUT 500
 #define DEFAULT_ZERO_CMD     "Z"
 #define DEFAULT_CAPACITY     5000.0f
 #define DEFAULT_RESOLUTION   0.01f
@@ -388,8 +388,6 @@ void loadConfig() {
     cfg_txPin    = cfgPrefs.getUChar("txpin",  DEFAULT_TX);
     cfg_swapRxTx = cfgPrefs.getBool ("swap",   DEFAULT_SWAP);
     cfg_lineTimeout = cfgPrefs.getUShort("timeout", DEFAULT_LINE_TIMEOUT);
-    cfg_capacity = cfgPrefs.getFloat("cap", DEFAULT_CAPACITY);
-    cfg_resolution = cfgPrefs.getFloat("res", DEFAULT_RESOLUTION);
     cfg_protocol = (BalanceProtocol)cfgPrefs.getUChar("proto", protocolForBrand(DEFAULT_BRAND));
     cfg_confidence = cfgPrefs.getUChar("conf", 100);
     cfg_autodetect = cfgPrefs.getBool("autoscan", false);
