@@ -135,7 +135,7 @@ typedef struct {
   float    capacity;
   float    resolution;
   char     firmwareVariant[24];
-  char     balanceId[20];
+  char     balanceId[21];
   char     displayLabel[32];
 } node_entry_t;
 
@@ -147,7 +147,7 @@ typedef struct __attribute__((packed)) {
 } stored_node_t;
 
 typedef struct __attribute__((packed)) {
-  char     balanceId[20];
+  char     balanceId[21];
   char     displayLabel[32];
 } stored_node_meta_t;
 
@@ -244,6 +244,7 @@ static unsigned long badPackets = 0;
 static uint16_t txSeq = 0;
 static bool displayDirty = true;
 static unsigned long lastDisplayUpdate = 0;
+static unsigned long lastNavAt = 0;
 
 static char apSsid[32];
 static char apIp[16];
@@ -253,6 +254,7 @@ static int profileCount = 0;
 static bool soundEnabled = true;
 static bool serialReplyBeepEnabled = true;
 static bool serialReplyHapticEnabled = true;
+static int pendingConfigPushIdx = -1;
 static float parseWeightValue(const char* raw);
 static volatile bool pendingBeep = false;
 static bool apiBalanceReplyPending = false;
@@ -512,7 +514,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;backg
 .sh-title{font-size:17px;font-weight:700}
 .sh-close{color:var(--blue);font-size:15px;font-weight:600;cursor:pointer;padding:4px 0 4px 12px}
 .sh-body{padding:16px}
-.action-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0 4px}
+.action-row{display:grid;grid-template-columns:1fr 1.45fr;gap:10px;margin:12px 0 4px}
+.write-id-wrap{display:flex;gap:8px;align-items:stretch}
+.write-id-input{min-width:0;flex:1;border:1px solid var(--border);border-radius:14px;background:var(--surface);color:var(--blue);font-family:inherit;font-size:14px;font-weight:600;padding:0 12px;outline:none}
+.write-id-input:focus{border-color:rgba(0,122,255,.42);box-shadow:0 0 0 3px rgba(0,122,255,.12)}
+.write-id-wrap .btn{flex:0 0 auto;width:auto;min-width:116px}
 .btn-sm{padding:12px 14px;font-size:14px}
 @media (max-width:640px){
   .ov{align-items:flex-end;padding:0}
@@ -520,6 +526,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;backg
   @keyframes modalup{from{transform:translateY(100%)}to{transform:translateY(0)}}
   .sh-handle{display:block;width:36px;height:4px;background:var(--text4);border-radius:2px;margin:10px auto 0}
   .action-row{grid-template-columns:1fr}
+  .write-id-wrap{display:grid;grid-template-columns:1fr auto}
 }
 
 /* Form */
@@ -565,6 +572,7 @@ input.fc[type=number]{max-width:76px}
   .sh-hdr{padding:14px 16px}
   .sh-body{padding:14px}
   .action-row{grid-template-columns:1fr}
+  .write-id-wrap{display:grid;grid-template-columns:1fr auto}
   .fr{display:block;padding:10px 16px 12px}
   .fl{display:block;padding:0 0 6px;white-space:normal}
   .fc{display:block;width:100%;max-width:none;padding:6px 0 0;text-align:left}
@@ -689,7 +697,7 @@ input.fc[type=number]{max-width:76px}
         </div>
         <div class="fr">
           <label class="fl">ID balance</label>
-          <input class="fc" id="c-balance-id" type="text" maxlength="2" placeholder="05" oninput="syncLabelFromBalanceId()">
+          <input class="fc" id="c-balance-id" type="text" maxlength="20" placeholder="ID balance" oninput="syncLabelFromBalanceId()">
         </div>
         <div class="fr">
           <label class="fl">Type</label>
@@ -699,20 +707,9 @@ input.fc[type=number]{max-width:76px}
 
       <div class="action-row">
         <button class="btn btn-s btn-sm" onclick="readBalanceId()">Lire l'ID</button>
-        <button class="btn btn-s btn-sm" onclick="programBalanceId()">Ecrire l'ID</button>
-      </div>
-
-      <div id="mettler-write-wrap" style="display:none">
-        <div class="slbl">Programmation Mettler</div>
-        <div class="fg">
-          <div class="fr">
-            <label class="fl">Valeur a ecrire</label>
-            <input class="fc" id="c-balance-id-write" type="text" maxlength="2" placeholder="06" oninput="syncWriteBalanceId()">
-          </div>
-          <div class="fr">
-            <label class="fl">Commande envoyee</label>
-            <input class="fc" id="c-balance-id-cmd" type="text" readonly value='I10 ""'>
-          </div>
+        <div class="write-id-wrap" id="mettler-write-wrap">
+          <input class="write-id-input" id="c-balance-id-write" type="text" maxlength="20" placeholder="ID a ecrire" aria-label="ID balance a ecrire" oninput="syncWriteBalanceId()">
+          <button class="btn btn-s btn-sm" onclick="programBalanceId()">Ecrire l'ID</button>
         </div>
       </div>
 
@@ -803,11 +800,7 @@ input.fc[type=number]{max-width:76px}
       </div>
 
       <div class="btns">
-        <button class="btn btn-s" onclick="applyProfile()">Appliquer le profil</button>
-        <button class="btn btn-s" onclick="saveProfile()">Sauver et appliquer</button>
-        <button class="btn btn-s" onclick="duplicateProfile()">Dupliquer</button>
-        <button class="btn btn-s" onclick="deleteProfile()">Supprimer le profil</button>
-        <button class="btn btn-p" onclick="saveConf()">Sauver &amp; Pousser</button>
+        <button class="btn btn-p" onclick="saveSheet()">Sauvegarder</button>
         <button class="btn btn-s" onclick="closeSheet()">Annuler</button>
       </div>
     </div>
@@ -831,6 +824,26 @@ let soundOn=true;
 let serialReplyBeepOn=true;
 let serialReplyHapticOn=true;
 let scanBusy=false;
+let nodesLoading=false;
+let suppressNodeErrorsUntil=0;
+
+async function apiFetch(url, opts={}, timeoutMs=3500){
+  const ctrl=new AbortController();
+  const timer=setTimeout(()=>ctrl.abort(),timeoutMs);
+  try{
+    return await fetch(url,{...opts,signal:ctrl.signal});
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
+function pauseNodeErrors(ms=5000){
+  suppressNodeErrorsUntil=Date.now()+ms;
+}
+
+function scheduleLoadNodes(delay=0, force=false){
+  setTimeout(()=>loadNodes(force),delay);
+}
 
 function currentSerialReplyMode(){
   if(serialReplyBeepOn && serialReplyHapticOn) return 'both';
@@ -859,18 +872,26 @@ function normalizedBalanceIdValue(raw){
   return m?m[1]:'';
 }
 
+function typedBalanceIdValue(raw){
+  return (raw||'').replace(/\D/g,'').slice(0,2);
+}
+
+function typedMettlerWriteIdValue(raw){
+  return (raw||'').toUpperCase().replace(/[^A-Z0-9 ]/g,'').slice(0,20);
+}
+
 function syncLabelFromBalanceId(){
-  const id=normalizedBalanceIdValue(document.getElementById('c-balance-id').value);
-  document.getElementById('c-balance-id').value=id;
+  const value=typedMettlerWriteIdValue(document.getElementById('c-balance-id').value);
+  document.getElementById('c-balance-id').value=value;
+  const id=normalizedBalanceIdValue(value);
   if(id){
     document.getElementById('c-label').value='CDO '+id;
   }
 }
 
 function syncWriteBalanceId(){
-  const id=normalizedBalanceIdValue(document.getElementById('c-balance-id-write').value);
+  const id=typedMettlerWriteIdValue(document.getElementById('c-balance-id-write').value);
   document.getElementById('c-balance-id-write').value=id;
-  document.getElementById('c-balance-id-cmd').value='I10 "'+id+'"';
 }
 
 function setMettlerWriteVisibility(brand){
@@ -879,7 +900,6 @@ function setMettlerWriteVisibility(brand){
   if(wrap) wrap.style.display=isMettler?'block':'none';
   if(!isMettler){
     document.getElementById('c-balance-id-write').value='';
-    document.getElementById('c-balance-id-cmd').value='I10 ""';
   }else{
     syncWriteBalanceId();
   }
@@ -908,14 +928,14 @@ async function startNodeScan(){
   if(scanBusy) return;
   setScanBusy(true);
   try{
-    const r=await fetch('/api/scan',{method:'POST'});
+    const r=await apiFetch('/api/scan',{method:'POST'});
     const d=await parseJsonResponse(r);
     toast(r.ok?(d.message||'Recherche lancee'):(d.error||'Erreur scan'),r.ok);
     if(r.ok){
-      loadNodes();
-      setTimeout(loadNodes,800);
-      setTimeout(loadNodes,2200);
-      setTimeout(loadNodes,4200);
+      scheduleLoadNodes(0,true);
+      scheduleLoadNodes(900,true);
+      scheduleLoadNodes(2400,true);
+      scheduleLoadNodes(4600,true);
     }
   }catch(e){
     toast(String(e&&e.message?e.message:'Erreur reseau'),false);
@@ -927,7 +947,7 @@ async function startNodeScan(){
 async function purgeNodes(){
   if(!confirm('Purger tous les nodes sauvegardes du knob et reinitialiser les Atom actuellement en ligne ?')) return;
   try{
-    const r=await fetch('/api/purge',{method:'POST'});
+    const r=await apiFetch('/api/purge',{method:'POST'},5000);
     const d=await parseJsonResponse(r);
     const msg=r.ok
       ?((d.message||'Purge terminee')+(typeof d.remoteResetCount==='number'?' ('+d.remoteResetCount+' Atom reinitialise'+(d.remoteResetCount>1?'s':'')+')':''))
@@ -935,18 +955,21 @@ async function purgeNodes(){
     toast(msg,r.ok);
     if(r.ok){
       nodes=[];
-      loadNodes();
-      setTimeout(loadNodes,1200);
-      setTimeout(loadNodes,3500);
+      scheduleLoadNodes(0,true);
+      scheduleLoadNodes(1400,true);
+      scheduleLoadNodes(3800,true);
     }
   }catch(e){
     toast(String(e&&e.message?e.message:'Erreur reseau'),false);
   }
 }
 
-async function loadNodes(){
+async function loadNodes(force=false){
+  if(nodesLoading) return;
+  if(!force && document.getElementById('ov').classList.contains('open')) return;
+  nodesLoading=true;
   try{
-    const r=await fetch('/api/nodes');
+    const r=await apiFetch('/api/nodes',{},3000);
     if(!r.ok) throw new Error('nodes_http_'+r.status);
     const raw=await r.text();
     try{
@@ -958,9 +981,12 @@ async function loadNodes(){
     document.getElementById('hdr-sub').textContent=n+' node'+(n!==1?'s':'');
     document.getElementById('ssid-name').textContent='BDP-Hub';
   }catch(e){
+    if(Date.now()<suppressNodeErrorsUntil) return;
     const msg=String(e&&e.message?e.message:e);
     document.getElementById('nlist').innerHTML='<div class="empty"><div class="empty-ico">&#9888;</div><div class="empty-ttl">Erreur de connexion</div><div class="empty-sub">'+esc(msg)+'</div></div>';
     return;
+  }finally{
+    nodesLoading=false;
   }
   try{
     render();
@@ -971,7 +997,7 @@ async function loadNodes(){
 
 async function loadProfiles(){
   try{
-    const r=await fetch('/api/profiles');
+    const r=await apiFetch('/api/profiles');
     if(!r.ok) throw new Error('profiles_http_'+r.status);
     const raw=await r.text();
     profiles=JSON.parse(raw);
@@ -983,7 +1009,7 @@ async function loadProfiles(){
 
 async function loadSettings(){
   try{
-    const r=await fetch('/api/settings');
+    const r=await apiFetch('/api/settings');
     const d=await r.json();
     setSnd(d.sound!==false);
     setSerialReplyBeep(d.serialReplyBeep!==false);
@@ -1014,7 +1040,7 @@ function setSerialReplyHaptic(on){
 }
 
 async function pushSettings(){
-  try{await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sound:soundOn,serialReplyBeep:serialReplyBeepOn,serialReplyHaptic:serialReplyHapticOn})});}catch(e){}
+  try{await apiFetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sound:soundOn,serialReplyBeep:serialReplyBeepOn,serialReplyHaptic:serialReplyHapticOn})});}catch(e){}
 }
 
 function applySerialReplyMode(mode){
@@ -1204,7 +1230,8 @@ function currentProfileNameInput(){
 
 function syncProfileNameFromSelect(){
   const selected=(document.getElementById('c-profile').value||'').trim();
-  if(selected) document.getElementById('c-profile-name').value=selected;
+  const id=parseInt(document.getElementById('c-id').value);
+  if(selected && (!Number.isFinite(id) || id<=0)) document.getElementById('c-profile-name').value=selected;
 }
 
 function sv(id,v){const e=document.getElementById(id);if(e)e.value=String(v);}
@@ -1237,37 +1264,56 @@ async function readBalanceId(){
     return;
   }
   try{
-    const r=await fetch('/api/balance-id/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,brand:parseInt(document.getElementById('c-brand').value)})});
+    pauseNodeErrors(5000);
+    const r=await apiFetch('/api/balance-id/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,brand:parseInt(document.getElementById('c-brand').value)})},5000);
     const d=await r.json();
     if(!r.ok){
       toast(d.error||'Lecture impossible',false);
       return;
     }
-  if(d.balanceId){
-      document.getElementById('c-balance-id').value=d.balanceId;
-      document.getElementById('c-balance-id-write').value=d.balanceId;
-      syncWriteBalanceId();
-      document.getElementById('c-label').value='CDO '+d.balanceId;
+    if(d.balanceId){
+      const clientId=normalizedBalanceIdValue(d.balanceId);
+      if(clientId){
+        document.getElementById('c-balance-id').value=clientId;
+        document.getElementById('c-label').value='CDO '+clientId;
+      }
+      document.getElementById('c-balance-id-write').value=typedMettlerWriteIdValue(d.balanceId);
     }
     toast(d.message||('ID lu: '+(d.balanceId||d.raw||'?')),true);
-    await loadNodes();
+    await loadNodes(true);
   }catch(e){toast('Erreur reseau',false);}
 }
 
 async function saveConf(){
   const id=parseInt(document.getElementById('c-id').value);
   if(!Number.isFinite(id) || id<=0){
-    toast('Utilisez Sauver et appliquer ou Dupliquer depuis un node existant',false);
+    toast('Choisissez un node ou renseignez un nom de profil',false);
     return;
   }
   const body={id,...currentConfigPayload()};
   closeSheet();
   try{
-    const r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    pauseNodeErrors(6500);
+    const r=await apiFetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},5000);
     const d=await r.json();
     toast(r.ok?d.message:d.error,r.ok);
-    if(r.ok)setTimeout(loadNodes,4000);
+    if(r.ok)scheduleLoadNodes(4200,true);
   }catch(e){toast('Erreur reseau',false);}
+}
+
+async function saveSheet(){
+  const id=parseInt(document.getElementById('c-id').value);
+  if(Number.isFinite(id) && id>0){
+    await saveConf();
+    return;
+  }
+
+  const profileName=currentProfileNameInput()||(document.getElementById('c-profile').value||'').trim();
+  if(!profileName){
+    toast('Renseignez un nom de profil',false);
+    return;
+  }
+  await saveProfile();
 }
 
 function currentConfigPayload(){
@@ -1308,21 +1354,24 @@ async function programBalanceId(){
     toast('Disponible uniquement pour Mettler',false);
     return;
   }
-  const balanceId=normalizedBalanceIdValue(document.getElementById('c-balance-id-write').value);
+  const balanceId=typedMettlerWriteIdValue(document.getElementById('c-balance-id-write').value).trim();
   if(!balanceId){
-    toast('Renseignez une valeur Mettler a ecrire',false);
+    toast('Renseignez l ID a ecrire',false);
     return;
   }
   document.getElementById('c-balance-id-write').value=balanceId;
-  syncWriteBalanceId();
   try{
-    const r=await fetch('/api/balance-id',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,balanceId})});
+    pauseNodeErrors(5000);
+    const r=await apiFetch('/api/balance-id',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,balanceId})},5000);
     const d=await r.json();
     toast(r.ok?(d.message||'ID programme'):(d.error||'Erreur'),r.ok);
     if(r.ok){
+      const clientId=normalizedBalanceIdValue(balanceId);
       document.getElementById('c-balance-id').value=balanceId;
-      document.getElementById('c-label').value='CDO '+balanceId;
-      await loadNodes();
+      if(clientId){
+        document.getElementById('c-label').value='CDO '+clientId;
+      }
+      await loadNodes(true);
     }
   }catch(e){toast('Erreur reseau',false);}
 }
@@ -1334,7 +1383,8 @@ async function saveProfile(){
   if(!profileName) return;
   const body={profileName,...currentConfigPayload()};
   try{
-    const r=await fetch('/api/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    pauseNodeErrors(6500);
+    const r=await apiFetch('/api/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},5000);
     const d=await r.json();
     if(!r.ok){
       toast(d.error||'Erreur',false);
@@ -1349,12 +1399,12 @@ async function saveProfile(){
       closeSheet();
       return;
     }
-    const ra=await fetch('/api/profiles/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,profileName})});
+    const ra=await apiFetch('/api/profiles/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,profileName})},5000);
     const da=await ra.json();
     toast(ra.ok?'Profil sauvegarde et applique':(da.error||'Profil sauvegarde, application impossible'),ra.ok);
     if(ra.ok){
       closeSheet();
-      setTimeout(loadNodes,4000);
+      scheduleLoadNodes(4200,true);
     }
   }catch(e){toast('Erreur reseau',false);}
 }
@@ -1368,7 +1418,8 @@ async function duplicateProfile(){
   document.getElementById('c-profile').value='';
   const body={profileName,...currentConfigPayload()};
   try{
-    const r=await fetch('/api/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    pauseNodeErrors(6500);
+    const r=await apiFetch('/api/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)},5000);
     const d=await r.json();
     if(!r.ok){
       toast(d.error||'Erreur',false);
@@ -1383,12 +1434,12 @@ async function duplicateProfile(){
       closeSheet();
       return;
     }
-    const ra=await fetch('/api/profiles/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,profileName})});
+    const ra=await apiFetch('/api/profiles/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,profileName})},5000);
     const da=await ra.json();
     toast(ra.ok?'Profil duplique et applique':(da.error||'Profil sauvegarde, application impossible'),ra.ok);
     if(ra.ok){
       closeSheet();
-      setTimeout(loadNodes,4000);
+      scheduleLoadNodes(4200,true);
     }
   }catch(e){toast('Erreur reseau',false);}
 }
@@ -1399,12 +1450,13 @@ async function applyProfile(){
   if(!profileName){toast('Choisissez un profil',false);return;}
   if(!Number.isFinite(id) || id<=0){toast('Choisissez un node pour appliquer ce profil',false);return;}
   try{
-    const r=await fetch('/api/profiles/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,profileName})});
+    pauseNodeErrors(6500);
+    const r=await apiFetch('/api/profiles/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,profileName})},5000);
     const d=await r.json();
     toast(r.ok?'Profil applique':(d.error||'Erreur'),r.ok);
     if(r.ok){
       closeSheet();
-      setTimeout(loadNodes,4000);
+      scheduleLoadNodes(4200,true);
     }
   }catch(e){toast('Erreur reseau',false);}
 }
@@ -1414,7 +1466,7 @@ async function deleteProfile(){
   if(!profileName) return;
   if(!confirm('Supprimer le profil '+profileName+' ?')) return;
   try{
-    const r=await fetch('/api/profiles?name='+encodeURIComponent(profileName),{method:'DELETE'});
+    const r=await apiFetch('/api/profiles?name='+encodeURIComponent(profileName),{method:'DELETE'});
     const d=await r.json();
     toast(r.ok?'Profil supprime':(d.error||'Erreur'),r.ok);
     if(r.ok){await loadProfiles();}
@@ -1433,10 +1485,10 @@ async function deleteNode(id){
   const nodeTitle=n.label||n.type||n.name||('Node '+id);
   if(!confirm('Supprimer '+nodeTitle+' de la liste ?'))return;
   try{
-    const r=await fetch('/api/nodes/delete?id='+encodeURIComponent(id),{method:'POST'});
+    const r=await apiFetch('/api/nodes/delete?id='+encodeURIComponent(id),{method:'POST'});
     const d=await parseJsonResponse(r);
     toast(r.ok?(d.message||'Appareil supprime'):(d.error||'Erreur suppression'),r.ok);
-    if(r.ok)loadNodes();
+    if(r.ok)loadNodes(true);
   }catch(e){toast(String(e&&e.message?e.message:'Erreur reseau'),false);}
 }
 
@@ -1450,10 +1502,10 @@ function toast(msg,ok){
 }
 
 document.getElementById('ov').addEventListener('click',e=>{if(e.target===document.getElementById('ov'))closeSheet();});
-loadNodes();
+loadNodes(true);
 loadSettings();
 loadProfiles();
-setInterval(loadNodes,1500);
+setInterval(()=>loadNodes(false),4000);
 </script>
 </body>
 </html>
@@ -1987,6 +2039,21 @@ bool extractClientBalanceId(const char* raw, char* out, size_t outSize) {
   return false;
 }
 
+bool sanitizeMettlerWriteId(const char* raw, char* out, size_t outSize) {
+  if (!raw || !out || outSize < 2) return false;
+  size_t n = 0;
+  for (size_t i = 0; raw[i] && n < 20 && n + 1 < outSize; i++) {
+    char c = raw[i];
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    bool ok = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ';
+    if (!ok) continue;
+    out[n++] = c;
+  }
+  while (n > 0 && out[n - 1] == ' ') n--;
+  out[n] = 0;
+  return n > 0;
+}
+
 static bool extractQuotedValue(const char* raw, char* out, size_t outSize) {
   if (!raw || !out || outSize < 2) return false;
   const char* first = strchr(raw, '"');
@@ -2007,7 +2074,7 @@ static bool parseBalanceIdFromReply(uint8_t brand, const char* raw, char* out, s
   if (brand == BRAND_METTLER) {
     char quoted[32];
     if (extractQuotedValue(raw, quoted, sizeof(quoted)) &&
-        extractClientBalanceId(quoted, out, outSize)) return true;
+        sanitizeMettlerWriteId(quoted, out, outSize)) return true;
   }
   return extractClientBalanceId(raw, out, outSize);
 }
@@ -2180,17 +2247,22 @@ static void appendJsonEscaped(String& out, const char* value) {
 // Handlers web
 // =====================================================
 void handleRoot() {
+  webServer.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  webServer.sendHeader("Pragma", "no-cache");
+  webServer.sendHeader("Expires", "0");
   webServer.send_P(200, "text/html", HTML_PAGE);
+}
+
+void handleFavicon() {
+  webServer.send(204);
 }
 
 void handleApiNodes() {
   webServer.sendHeader("Access-Control-Allow-Origin", "*");
-  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  webServer.send(200, "application/json", "");
-  webServer.sendContent("[");
+  String body;
+  body.reserve((nodeCount * 768) + 16);
+  body += '[';
   for (int i = 0; i < nodeCount; i++) {
-    String body;
-    body.reserve(768);
     if (i > 0) body += ',';
     char mac[18];
     snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -2252,10 +2324,9 @@ void handleApiNodes() {
       body += '}';
     }
     body += '}';
-    webServer.sendContent(body);
   }
-  webServer.sendContent("]");
-  webServer.sendContent("");
+  body += ']';
+  webServer.send(200, "application/json", body);
 }
 
 void handleApiConfigSet() {
@@ -2324,8 +2395,8 @@ void handleApiConfigSet() {
   normalizeNodeIdentity(idx);
   nodes[idx].configKnown = true;
 
-  sendConfigSetToNode(idx);
   saveNodes();
+  pendingConfigPushIdx = idx;
 
   hubLogPrintf("@%02u CONFIG_SET brand=%d baud=%u\n",
     nodes[idx].id, nodes[idx].brand, nodes[idx].baud);
@@ -2359,8 +2430,8 @@ void handleApiBalanceIdSet() {
     webServer.send(400, "application/json", "{\"error\":\"node_offline\"}");
     return;
   }
-  char balanceId[20] = "";
-  if (!extractClientBalanceId(requested, balanceId, sizeof(balanceId))) {
+  char balanceId[21] = "";
+  if (!sanitizeMettlerWriteId(requested, balanceId, sizeof(balanceId))) {
     webServer.send(400, "application/json", "{\"error\":\"invalid_balance_id\"}");
     return;
   }
@@ -2369,13 +2440,16 @@ void handleApiBalanceIdSet() {
     return;
   }
 
-  char cmd[24];
+  char cmd[64];
   snprintf(cmd, sizeof(cmd), "I10 \"%s\"", balanceId);
   sendLocalBalanceCmdToNode(idx, cmd);
-  strlcpy(nodes[idx].balanceId, balanceId, sizeof(nodes[idx].balanceId));
-  setNodeDisplayLabel(idx);
-  saveNodes();
-  hubLogPrintf("@%02u BALANCE_ID_SET %s\n", nodes[idx].id, balanceId);
+  char clientId[21] = "";
+  if (extractClientBalanceId(balanceId, clientId, sizeof(clientId))) {
+    strlcpy(nodes[idx].balanceId, clientId, sizeof(nodes[idx].balanceId));
+    setNodeDisplayLabel(idx);
+    saveNodes();
+  }
+  hubLogPrintf("@%02u BALANCE_ID_SET %s cmd=%s\n", nodes[idx].id, balanceId, cmd);
   webServer.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"ID balance programme\"}");
 }
 
@@ -2418,12 +2492,15 @@ void handleApiBalanceIdRead() {
     webServer.send(504, "application/json", "{\"error\":\"read_timeout\"}");
     return;
   }
-  char balanceId[20] = "";
+  char balanceId[21] = "";
   bool ok = parseBalanceIdFromReply(brand, raw, balanceId, sizeof(balanceId));
   if (ok) {
-    strlcpy(nodes[idx].balanceId, balanceId, sizeof(nodes[idx].balanceId));
-    setNodeDisplayLabel(idx);
-    saveNodes();
+    char clientId[21] = "";
+    if (extractClientBalanceId(balanceId, clientId, sizeof(clientId))) {
+      strlcpy(nodes[idx].balanceId, clientId, sizeof(nodes[idx].balanceId));
+      setNodeDisplayLabel(idx);
+      saveNodes();
+    }
   }
   String body = "{\"status\":\"ok\",\"message\":\"ID lu\",\"raw\":";
   appendJsonEscaped(body, raw);
@@ -2513,12 +2590,10 @@ void handleApiSettingsSet() {
 
 void handleApiProfiles() {
   webServer.sendHeader("Access-Control-Allow-Origin", "*");
-  webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  webServer.send(200, "application/json", "");
-  webServer.sendContent("[");
+  String body;
+  body.reserve((profileCount * 512) + 16);
+  body += '[';
   for (int i = 0; i < profileCount; i++) {
-    String body;
-    body.reserve(512);
     if (i > 0) body += ',';
     char profileBalanceId[20] = "";
     extractClientBalanceId(profiles[i].label, profileBalanceId, sizeof(profileBalanceId));
@@ -2561,10 +2636,9 @@ void handleApiProfiles() {
     body += ",\"protocol\":";
     body += String(protocolForBrand(profiles[i].brand));
     body += '}';
-    webServer.sendContent(body);
   }
-  webServer.sendContent("]");
-  webServer.sendContent("");
+  body += ']';
+  webServer.send(200, "application/json", body);
 }
 
 void handleApiProfilesSave() {
@@ -3170,6 +3244,8 @@ static void uiEvtStartScan(lv_event_t*) {
 }
 
 static void uiEvtOpenWifiQr(lv_event_t*) {
+  if (millis() - lastNavAt < 350) return;
+  lastNavAt = millis();
   uiState = STATE_WIFI_QR;
   displayDirty = true;
 }
@@ -3187,6 +3263,8 @@ static void uiEvtIdentifyNode(lv_event_t* e) {
 }
 
 static void uiEvtBack(lv_event_t*) {
+  if (millis() - lastNavAt < 350) return;
+  lastNavAt = millis();
   listAnimFrom = -1;
   listAnimTo = -1;
   listAnimDir = 0;
@@ -3198,6 +3276,8 @@ static void uiEvtBack(lv_event_t*) {
 }
 
 static void uiEvtHome(lv_event_t*) {
+  if (millis() - lastNavAt < 350) return;
+  lastNavAt = millis();
   listAnimFrom = -1;
   listAnimTo = -1;
   listAnimDir = 0;
@@ -3209,6 +3289,8 @@ static void uiEvtHome(lv_event_t*) {
 }
 
 static void uiEvtCloseWifiQr(lv_event_t*) {
+  if (millis() - lastNavAt < 350) return;
+  lastNavAt = millis();
   uiState = STATE_LIST;
   displayDirty = true;
 }
@@ -3525,11 +3607,11 @@ static bool addWifiQrCode(lv_obj_t* parent, const char* payload, int x, int y, i
 }
 
 static void addHeaderBackButton(lv_obj_t* scr, lv_event_cb_t cb) {
-  addIconButton(scr, 58, 50, 44, LV_SYMBOL_LEFT, cb, NULL, false, 1, 1, LV_EVENT_PRESSED);
+  addIconButton(scr, 58, 50, 44, LV_SYMBOL_LEFT, cb, NULL, false, 1, 1, LV_EVENT_CLICKED);
 }
 
 static void addHeaderActionButton(lv_obj_t* scr, const char* icon, lv_event_cb_t cb, bool active = false, uint8_t feedbackIdx = 255, uint8_t hapticEffect = 1) {
-  addIconButton(scr, 258, 50, 44, icon, cb, NULL, active, feedbackIdx, hapticEffect, LV_EVENT_PRESSED);
+  addIconButton(scr, 258, 50, 44, icon, cb, NULL, active, feedbackIdx, hapticEffect, LV_EVENT_CLICKED);
 }
 
 static void renderWeightFace(lv_obj_t* scr, bool compactCards) {
@@ -3651,7 +3733,7 @@ static void uiRenderScanning(lv_obj_t* scr) {
 }
 
 static void uiRenderList(lv_obj_t* scr) {
-  addIconButton(scr, 58, 50, 44, "QR", uiEvtOpenWifiQr, NULL, flashBtnIdx == 3, 3, 1, LV_EVENT_PRESSED);
+  addIconButton(scr, 58, 50, 44, "QR", uiEvtOpenWifiQr, NULL, flashBtnIdx == 3, 3, 1, LV_EVENT_CLICKED);
   addCenteredText(scr, "Appareils", UI_CX, 46, &lv_font_montserrat_24, C_TEXT);
   char sub[32];
   snprintf(sub, sizeof(sub), "%d/%d en ligne", activeNodeCount(), nodeCount);
@@ -3847,6 +3929,7 @@ void setup() {
   esp_now_register_send_cb(onSent);
 
   webServer.on("/", HTTP_GET, handleRoot);
+  webServer.on("/favicon.ico", HTTP_GET, handleFavicon);
   webServer.on("/api/nodes",    HTTP_GET,     handleApiNodes);
   webServer.on("/api/nodes",    HTTP_DELETE,  handleApiNodeDelete);
   webServer.on("/api/nodes",    HTTP_OPTIONS, handleApiOptions);
@@ -3890,6 +3973,14 @@ void loop() {
   handleTouch();
   handleEncoder();
   webServer.handleClient();
+
+  if (pendingConfigPushIdx >= 0 && pendingConfigPushIdx < nodeCount) {
+    int idx = pendingConfigPushIdx;
+    pendingConfigPushIdx = -1;
+    sendConfigSetToNode(idx);
+  } else if (pendingConfigPushIdx >= nodeCount) {
+    pendingConfigPushIdx = -1;
+  }
 
   if (flashBtnIdx >= 0 && millis() - flashBtnAt >= BTN_FLASH_MS) {
     flashBtnIdx = -1;
