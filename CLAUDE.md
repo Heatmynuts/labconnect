@@ -38,6 +38,10 @@ Autoscan (lignes 87-99) : A&D aussi sondé à 4800 et 9600/7E1 ; Mettler SICS à
 - Bridges JS injectés : `LabConnectSunmiPrinter`, `LabConnectScanner` (MainActivity.kt:68-69). NB : pas de bridge `LabConnectDevice` (seulement `LabConnectDeviceAdminReceiver`, admin device Android).
 - Package : `com.labconnect.print` ; app Hub Java séparée : `fr.bdp.labconnect.sunmihub` (non commitée hors backup)
 
+## Firmwares AtomS3 Node (refactoring de juin 2026, non commité hors backup)
+- Cœur commun : `firmware/atom-s3/LabConnectAtomS3Node/LabConnectAtomS3NodeCore.h` ; firmware recommandé : `LabConnectAtomS3Node.ino` (marque/RS232 configurés depuis le knob)
+- `atoms3-node.ino`, `atoms3-node-and.ino`, `atoms3-node-mettler.ino` (working tree) = points d'entrée de compatibilité de 9-19 lignes (`#define FW_VARIANT_CODE`…) incluant le cœur — leurs versions commitées de ~1760 lignes sont l'ancien état, pas une référence
+
 ## Conventions
 - Protocoles côté web : passer par `packages/protocols`, ne pas coder les protocoles dans les composants React (docs/protocols.md)
 - `PRODUCT.md` du Hub Sunmi : registre produit pour le skill de design (LabConnect Hub - Sunmi V3/PRODUCT.md)
