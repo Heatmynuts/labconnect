@@ -6,3 +6,4 @@ apps/**/dist/
 apps/**/node_modules/
 apps/**/src-tauri/target/
 apps/**/src-tauri/gen/
+.gstack/

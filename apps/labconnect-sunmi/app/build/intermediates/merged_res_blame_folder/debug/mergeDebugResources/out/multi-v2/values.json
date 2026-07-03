@@ -1,0 +1,20 @@
+{
+    "logs": [
+        {
+            "outputFile": "fr.bdp.labconnect.sunmi.app-mergeDebugResources-2:/values/values.xml",
+            "map": [
+                {
+                    "source": "/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/res/values/styles.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "55",
+                        "endLines": "8",
+                        "endColumns": "12",
+                        "endOffsets": "438"
+                    }
+                }
+            ]
+        }
+    ]
+}

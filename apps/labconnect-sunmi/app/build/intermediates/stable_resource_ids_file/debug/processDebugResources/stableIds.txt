@@ -1,0 +1,3 @@
+fr.bdp.labconnect.sunmi:xml/network_security_config = 0x7f030000
+fr.bdp.labconnect.sunmi:style/AppTheme = 0x7f020000
+fr.bdp.labconnect.sunmi:drawable/ic_launcher = 0x7f010000

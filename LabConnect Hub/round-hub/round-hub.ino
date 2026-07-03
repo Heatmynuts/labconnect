@@ -8,6 +8,7 @@
 #include <esp_wifi.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include <Update.h>
 #include <ArduinoJson.h>
 #include <driver/i2s_std.h>
 #include <driver/gpio.h>
@@ -29,11 +30,15 @@ static volatile int32_t encRaw = 0;
 #define DISPLAY_H             360
 #define SCAN_DURATION_MS      3000
 #define DISCOVER_INTERVAL_MS  300
+#define BOOT_SCAN_DELAY_MS    1200
+#define BOOT_SCAN_DURATION_MS 2200
+#define BOOT_DISCOVER_INTERVAL_MS 850
 #define DISPLAY_REFRESH_MS    50
 #define HISTORY_SIZE          3
 #define CMD_TIMEOUT_MS        4000
 #define OFFLINE_TIMEOUT_MS    5000
 #define USB_BOOT_MUTE_MS      5000
+#define BOOT_LOGO_MS          5000
 
 // WiFi AP
 #define AP_SSID_PREFIX  "BDP-Hub-"
@@ -136,7 +141,11 @@ typedef struct {
   float    resolution;
   char     firmwareVariant[24];
   char     balanceId[21];
+  char     balanceSerial[24];
+  char     balanceIdRaw[32];
   char     displayLabel[32];
+  char     lastValue[64];
+  unsigned long lastValueTime;
 } node_entry_t;
 
 typedef struct __attribute__((packed)) {
@@ -150,6 +159,11 @@ typedef struct __attribute__((packed)) {
   char     balanceId[21];
   char     displayLabel[32];
 } stored_node_meta_t;
+
+typedef struct __attribute__((packed)) {
+  char     balanceSerial[24];
+  char     balanceIdRaw[32];
+} stored_node_identity_t;
 
 typedef struct __attribute__((packed)) {
   uint8_t  brand;
@@ -186,7 +200,7 @@ typedef struct __attribute__((packed)) {
   float    resolution;
 } stored_profile_t;
 
-enum UIState { STATE_IDLE, STATE_SCANNING, STATE_LIST, STATE_CONNECTED, STATE_WIFI_QR };
+enum UIState { STATE_BOOT_LOGO, STATE_IDLE, STATE_SCANNING, STATE_LIST, STATE_CONNECTED, STATE_WIFI_QR };
 
 // Pending command tracking
 typedef enum { PEND_NONE, PEND_BALANCE, PEND_PING, PEND_INFO } pending_kind_t;
@@ -196,7 +210,9 @@ static uint8_t lineEndingForBrand(uint8_t brand);
 static void normalizeNodeIdentity(int idx);
 void setNodeDisplayLabel(int idx);
 static bool sendBalanceCmdAndWait(int idx, const char* cmd, char* out, size_t outSize, unsigned long timeoutMs);
+static bool extractAdIdentityValue(const char* raw, const char* prefix, char* out, size_t outSize);
 static bool parseBalanceIdFromReply(uint8_t brand, const char* raw, char* out, size_t outSize);
+static int activeNodeCount();
 
 // =====================================================
 // Globals
@@ -205,7 +221,7 @@ static node_entry_t nodes[MAX_NODES];
 static int  nodeCount = 0;
 static int  selectedNode = -1;
 static int  listScroll = 0;
-static UIState uiState = STATE_LIST;
+static UIState uiState = STATE_BOOT_LOGO;
 static float tareOffset[MAX_NODES];
 static float pendingTareAdjust[MAX_NODES];
 static bool  pendingTare[MAX_NODES];
@@ -245,9 +261,21 @@ static uint16_t txSeq = 0;
 static bool displayDirty = true;
 static unsigned long lastDisplayUpdate = 0;
 static unsigned long lastNavAt = 0;
+static unsigned long bootLogoStart = 0;
+static bool bootScanActive = false;
+static bool bootScanScheduled = false;
+static unsigned long bootScanAt = 0;
 
 static char apSsid[32];
+static char apPass[64];
 static char apIp[16];
+static bool pendingWifiApply = false;
+static unsigned long pendingWifiApplyAt = 0;
+static unsigned long lastWifiApCheckAt = 0;
+static bool pendingOtaReboot = false;
+static unsigned long pendingOtaRebootAt = 0;
+static bool otaUpdateOk = false;
+static String otaUpdateError;
 static stored_profile_t profiles[MAX_PROFILES];
 static int profileCount = 0;
 
@@ -412,114 +440,145 @@ static const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>BDP Hub</title>
 <style>
-:root{--blue:#007AFF;--green:#34C759;--red:#FF3B30;--bg:#F2F2F7;--surface:#FFF;--border:rgba(60,60,67,.12);--text:#000;--text2:#3C3C43;--text3:rgba(60,60,67,.55);--text4:rgba(60,60,67,.25)}
+:root{
+  --blue:#0A84FF;--blue-press:#006EDB;--green:#30D158;--red:#FF453A;
+  --bg:#F5F6F8;--surface:#FFFFFF;--surface2:#F9FAFC;--surface3:#EEF1F6;
+  --border:rgba(60,60,67,.14);--border2:rgba(60,60,67,.22);
+  --text:#111318;--text2:#30343D;--text3:#69707D;--text4:#A8AFBA;
+  --shadow:0 1px 2px rgba(15,23,42,.04),0 12px 32px rgba(15,23,42,.08);
+  --shadow-soft:0 1px 1px rgba(15,23,42,.04),0 8px 18px rgba(15,23,42,.06);
+  --r:16px;--r2:12px;--pad:16px;
+}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+html{background:var(--bg)}
+body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',Arial,sans-serif;background:linear-gradient(180deg,#FBFCFE 0%,var(--bg) 160px);color:var(--text);min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+button,input,select{font:inherit}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid rgba(10,132,255,.22);outline-offset:2px}
 
 /* Header */
-.hdr{background:rgba(255,255,255,.82);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:.5px solid var(--border);position:sticky;top:0;z-index:50;height:56px;display:flex;align-items:center;padding:0 20px;gap:12px}
-.hdr-icon{width:32px;height:32px;background:var(--blue);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0}
-.hdr-text{flex:1}
-.hdr-title{font-size:17px;font-weight:700;letter-spacing:-.3px}
-.hdr-sub{font-size:12px;color:var(--text3);margin-top:1px}
+.hdr{background:rgba(255,255,255,.78);backdrop-filter:blur(24px) saturate(1.55);-webkit-backdrop-filter:blur(24px) saturate(1.55);border-bottom:1px solid rgba(60,60,67,.08);position:sticky;top:0;z-index:50;height:64px;display:flex;align-items:center;padding:0 max(18px,env(safe-area-inset-left));gap:12px}
+.hdr-icon{width:36px;height:36px;background:linear-gradient(180deg,#1D8CFF,#006FE6);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;color:#fff;box-shadow:0 6px 14px rgba(10,132,255,.22)}
+.hdr-text{flex:1;min-width:0}
+.hdr-title{font-size:18px;font-weight:750;letter-spacing:0;line-height:1.15}
+.hdr-sub{font-size:12px;color:var(--text3);margin-top:2px;font-weight:500}
+.hdr-action{width:38px;height:38px;border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.9);color:var(--blue);display:flex;align-items:center;justify-content:center;box-shadow:var(--shadow-soft);cursor:pointer;transition:transform .14s ease,background .14s ease}
+.hdr-action:active{transform:scale(.96);background:#F1F7FF}
+.hdr-action svg{width:19px;height:19px;stroke:currentColor;stroke-width:2.15;fill:none}
 
 /* Content */
-.cnt{padding:18px 12px calc(24px + env(safe-area-inset-bottom));max-width:760px;margin:0 auto}
+.cnt{padding:22px 14px calc(28px + env(safe-area-inset-bottom));max-width:900px;margin:0 auto}
 
 /* Section label */
-.slbl{font-size:12px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;margin:24px 0 8px 4px}
+.slbl{font-size:12px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.04em;margin:26px 0 9px 4px}
 .slbl:first-child{margin-top:0}
-.shead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:24px 0 8px 4px;flex-wrap:wrap}
+.shead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:28px 0 10px 4px;flex-wrap:wrap}
 .shead .slbl{margin:0}
 .sactions{display:flex;align-items:center;gap:8px}
-.sbtn{border:none;border-radius:11px;background:var(--surface);color:var(--blue);box-shadow:0 1px 0 var(--border);height:34px;padding:0 12px;font-size:13px;font-weight:600;font-family:inherit;display:inline-flex;align-items:center;gap:8px;cursor:pointer;transition:transform .1s,opacity .15s}
-.sbtn:active{transform:scale(.97);opacity:.8}
+.sbtn{border:1px solid var(--border);border-radius:12px;background:rgba(255,255,255,.88);color:var(--blue);box-shadow:var(--shadow-soft);height:38px;padding:0 13px;font-size:13px;font-weight:700;display:inline-flex;align-items:center;gap:8px;cursor:pointer;transition:transform .14s ease,background .14s ease,opacity .14s ease}
+.sbtn:active{transform:scale(.97);background:#F2F7FF;opacity:.9}
 .sbtn[disabled]{opacity:.55;cursor:default}
-.sbtn svg{width:15px;height:15px;stroke:currentColor;stroke-width:2;fill:none}
+.sbtn svg{width:16px;height:16px;stroke:currentColor;stroke-width:2.2;fill:none}
+.sbtn-icon{width:38px;padding:0;justify-content:center}
+.sbtn-icon svg{width:18px;height:18px}
 
 /* Info bar */
-.ibar{background:var(--surface);border-radius:14px;padding:14px 16px;display:flex;align-items:center;gap:14px;box-shadow:0 1px 0 var(--border)}
-.ibar-icon{font-size:22px;flex-shrink:0}
+.ibar{background:var(--surface);border:1px solid rgba(60,60,67,.09);border-radius:var(--r);padding:15px 16px;display:flex;align-items:center;gap:14px;box-shadow:var(--shadow-soft)}
+.ibar-icon{width:46px;height:42px;border-radius:12px;background:#EAF3FF;color:var(--blue);font-size:12px;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0;white-space:nowrap;letter-spacing:0}
 .ibar-body{flex:1;min-width:0}
-.ibar-name{font-size:14px;font-weight:600;color:var(--text2)}
-.ibar-hint{font-size:12px;color:var(--text3);margin-top:1px}
-.ibar-ip{font-size:14px;font-weight:700;color:var(--blue);flex-shrink:0}
+.ibar-name{font-size:15px;font-weight:750;color:var(--text)}
+.ibar-hint{font-size:12px;color:var(--text3);margin-top:2px;font-weight:500}
+.ibar-ip{font-size:14px;font-weight:750;color:var(--blue);flex-shrink:0;background:#F1F7FF;border:1px solid rgba(10,132,255,.14);border-radius:999px;padding:7px 10px}
+.network-actions{padding:10px 12px 12px}
+.network-actions .btn{min-height:44px}
+.ota-picker{padding:12px 16px 0}
+.ota-picker input{width:100%;color:var(--text2);font-size:14px}
+.ota-picker input::file-selector-button{border:none;border-radius:12px;background:rgba(60,60,67,.09);color:var(--text);font-weight:750;min-height:38px;padding:0 12px;margin-right:10px;cursor:pointer}
+.ota-status{padding:8px 16px 12px;font-size:12px;color:var(--text3);line-height:1.3}
+.password-wrap{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex:0 0 auto;max-width:220px}
+.password-wrap .fc{flex:1;max-width:none}
+.pw-eye{width:36px;height:36px;border:none;border-radius:10px;background:rgba(60,60,67,.08);color:var(--text3);display:flex;align-items:center;justify-content:center;cursor:pointer;flex:0 0 auto}
+.pw-eye:active{background:rgba(60,60,67,.14);transform:scale(.96)}
+.pw-eye svg{width:18px;height:18px;stroke:currentColor;stroke-width:2;fill:none}
 
 /* Node list */
-.ncard{background:var(--surface);border-radius:14px;overflow:hidden;box-shadow:0 1px 0 var(--border)}
-.ngrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;background:transparent;box-shadow:none;border-radius:0;overflow:visible}
-.node-card{aspect-ratio:1/.68;background:var(--surface);border-radius:14px;box-shadow:0 1px 0 var(--border);padding:10px;display:flex;flex-direction:column;justify-content:flex-start;gap:7px;cursor:pointer;transition:background .12s,transform .1s;min-width:0;position:relative}
-.node-card:active{background:#F4F4F4;transform:scale(.98)}
-.node-card.node-add{align-items:center;justify-content:center;gap:10px;background:#F7F9FD;border:1px dashed rgba(0,122,255,.28);box-shadow:none}
-.node-card.node-add .plus{width:52px;height:52px;border-radius:18px;background:#E8F1FF;color:var(--blue);display:flex;align-items:center;justify-content:center;font-size:34px;font-weight:300;line-height:1}
+.ncard{background:var(--surface);border:1px solid rgba(60,60,67,.09);border-radius:var(--r);overflow:hidden;box-shadow:var(--shadow-soft)}
+.ngrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;background:transparent;box-shadow:none;border-radius:0;overflow:visible}
+.node-card{aspect-ratio:1/1;background:var(--surface);border:1px solid rgba(60,60,67,.1);border-radius:var(--r);box-shadow:var(--shadow-soft);padding:11px;display:flex;flex-direction:column;justify-content:flex-start;gap:8px;cursor:pointer;transition:background .16s ease,transform .12s ease,border-color .16s ease,box-shadow .16s ease;min-width:0;position:relative;overflow:hidden}
+.node-card:active{background:#F7FAFF;transform:scale(.985);border-color:rgba(10,132,255,.24)}
+.node-card.node-add{align-items:center;justify-content:center;gap:12px;background:linear-gradient(180deg,#FFFFFF,#F4F8FF);border:1.5px dashed rgba(10,132,255,.28);box-shadow:none}
+.node-card.node-add .plus{width:54px;height:54px;border-radius:16px;background:#E9F3FF;color:var(--blue);display:flex;align-items:center;justify-content:center;font-size:34px;font-weight:300;line-height:1;border:1px solid rgba(10,132,255,.12)}
 .node-card.node-add .nname{font-size:16px}
-.node-card.node-add .nbrand{max-width:150px}
-.nrow{display:flex;align-items:center;padding:12px 16px;gap:13px;cursor:pointer;border-bottom:.5px solid var(--border);transition:background .12s}
+.node-card.node-add .nbrand{max-width:150px;white-space:normal}
+.nrow{display:flex;align-items:center;min-height:64px;padding:12px 16px;gap:13px;cursor:pointer;border-bottom:1px solid rgba(60,60,67,.09);transition:background .14s ease}
 .nrow:last-child{border-bottom:none}
-.nrow:active{background:#F4F4F4}
+.nrow:active{background:#F5F7FA}
 
 /* Avatar */
-.avt{width:44px;height:44px;border-radius:12px;background:#E8F0FE;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:800;color:var(--blue);flex-shrink:0;position:relative}
+.avt{width:44px;height:44px;border-radius:12px;background:#E8F2FF;display:flex;align-items:center;justify-content:center;font-size:14px;font-weight:800;color:var(--blue);flex-shrink:0;position:relative}
 .avt-dot{position:absolute;bottom:-2px;right:-2px;width:13px;height:13px;border-radius:50%;border:2.5px solid var(--surface)}
 .don{background:var(--green)}.doff{background:var(--text4)}
 
 /* Node info */
 .ninfo{flex:1;min-width:0}
-.node-card .ninfo{flex:1;display:flex;flex-direction:column;justify-content:center;gap:2px}
-.nname{font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.node-card .nname{font-size:18px;text-align:center;white-space:normal;line-height:1.06}
-.node-media{width:100%;height:58px;border-radius:9px;background:#F7F8FB;display:flex;align-items:center;justify-content:center;overflow:hidden;border:.5px solid var(--border)}
+.node-card .ninfo{flex:1;display:flex;flex-direction:column;justify-content:flex-start;gap:3px;min-height:0}
+.nname{font-size:15px;font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+.node-card .nname{font-size:21px;font-weight:800;text-align:center;white-space:normal;line-height:1.02;letter-spacing:0;margin-top:1px}
+.node-media{width:100%;height:86px;border-radius:12px;background:#F6F8FB;display:flex;align-items:center;justify-content:center;overflow:hidden;border:1px solid rgba(60,60,67,.09)}
 .node-img{width:100%;height:100%;object-fit:contain;background:#fff}
-.node-mark{font-size:12px;font-weight:700;color:var(--text3);text-align:center;padding:0 8px}
-.node-card.has-img .nname{font-size:16px}
-.nmeta{font-size:12px;color:var(--text3);margin-top:3px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.node-mark{font-size:12px;font-weight:750;color:var(--text3);text-align:center;padding:0 8px}
+.node-card.has-img .nname{font-size:19px}
+.nmeta{font-size:12px;color:var(--text3);margin-top:3px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;line-height:1.25}
 .node-card .nmeta{justify-content:center;text-align:center;gap:5px}
-.node-card .ntype{font-size:12px;font-weight:600;color:var(--text2);text-align:center;line-height:1.1}
-.node-card .nbrand{font-size:11px;color:var(--text3);text-align:center;line-height:1.08}
-.node-card .nstatus{margin-top:2px;display:flex;justify-content:center}
-.nbadge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:20px;font-size:10px;font-weight:600}
-.bon{background:rgba(52,199,89,.14);color:#1A7A35}.boff{background:rgba(60,60,67,.1);color:var(--text3)}
-.nacts{display:flex;align-items:center;gap:2px;flex-shrink:0}
-.node-card .nacts{justify-content:center}
+.node-card .ntype{font-size:13px;font-weight:700;color:var(--text2);text-align:center;line-height:1.12;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.node-card .nbrand{font-size:11px;color:var(--text3);font-weight:550;text-align:center;line-height:1.08;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.node-card .nvalue{font-size:18px;font-weight:800;color:var(--text);text-align:center;line-height:1.05;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.node-card .nvalue.muted{font-size:13px;font-weight:700;color:var(--text4)}
+.node-card .nstatus{margin-top:auto;display:flex;justify-content:center}
+.nbadge{display:inline-flex;align-items:center;padding:4px 8px;border-radius:999px;font-size:10px;font-weight:750;letter-spacing:0}
+.bon{background:rgba(48,209,88,.15);color:#176C2D}.boff{background:rgba(60,60,67,.1);color:var(--text3)}
+.nacts{display:flex;align-items:center;gap:3px;flex-shrink:0}
+.node-card .nacts{justify-content:center;margin-top:1px}
 .node-card .avt{display:none}
-.ibtn{width:30px;height:30px;border:none;border-radius:9px;background:transparent;color:var(--text3);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .12s,color .12s,transform .1s}
+.ibtn{width:34px;height:34px;border:none;border-radius:10px;background:transparent;color:var(--text3);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .14s ease,color .14s ease,transform .1s}
 .ibtn:active{background:rgba(60,60,67,.1);transform:scale(.94)}
 .ibtn svg{width:16px;height:16px;stroke:currentColor}
 .ibtn-del{color:var(--red)}
 
 /* Empty / Loading */
-.empty{padding:36px 20px;text-align:center;color:var(--text3)}
+.empty{padding:42px 20px;text-align:center;color:var(--text3);background:var(--surface);border:1px solid rgba(60,60,67,.09);border-radius:var(--r);box-shadow:var(--shadow-soft)}
+.ngrid>.empty{grid-column:1/-1}
 .empty-ico{font-size:36px;opacity:.4;margin-bottom:10px}
-.empty-ttl{font-size:16px;font-weight:600;color:var(--text2);margin-bottom:5px}
-.empty-sub{font-size:14px}
-.loading{padding:32px;display:flex;justify-content:center}
-.spin{width:24px;height:24px;border:2.5px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:rot .65s linear infinite}
+.empty-ttl{font-size:16px;font-weight:750;color:var(--text2);margin-bottom:5px}
+.empty-sub{font-size:14px;line-height:1.35}
+.loading{padding:42px;display:flex;justify-content:center;background:var(--surface);border-radius:var(--r);border:1px solid rgba(60,60,67,.09)}
+.spin{width:24px;height:24px;border:2.5px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:rot .75s linear infinite}
 @keyframes rot{to{transform:rotate(360deg)}}
 
 /* Toast */
-.toast{position:fixed;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%) translateY(80px);opacity:0;background:rgba(28,28,30,.9);color:#fff;padding:11px 20px;border-radius:14px;font-size:14px;font-weight:500;white-space:normal;transition:transform .3s cubic-bezier(.34,1.56,.64,1),opacity .3s;z-index:200;pointer-events:none;max-width:calc(100vw - 40px);text-align:center}
+.toast{position:fixed;bottom:calc(24px + env(safe-area-inset-bottom));left:50%;transform:translateX(-50%) translateY(80px);opacity:0;background:rgba(28,28,30,.92);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);color:#fff;padding:12px 18px;border-radius:14px;font-size:14px;font-weight:600;white-space:normal;transition:transform .24s cubic-bezier(.22,1,.36,1),opacity .24s;z-index:200;pointer-events:none;max-width:calc(100vw - 40px);text-align:center;box-shadow:0 16px 36px rgba(0,0,0,.22)}
 .toast.show{transform:translateX(-50%) translateY(0);opacity:1}
 .toast.ok:before{content:'✓  ';color:#4CD964}
 .toast.err:before{content:'✕  ';color:#FF6B6B}
 
 /* Sheet overlay */
-.ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.38);z-index:100;align-items:center;justify-content:center;padding:16px}
+.ov{display:none;position:fixed;inset:0;background:rgba(14,18,27,.42);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);z-index:100;align-items:center;justify-content:center;padding:16px}
 .ov.open{display:flex}
 
 /* Modal */
-.sheet{background:var(--bg);border-radius:22px;width:min(720px,calc(100vw - 24px));max-height:min(90vh,960px);overflow-y:auto;overflow-x:hidden;box-shadow:0 28px 80px rgba(0,0,0,.22);animation:modalin .22s ease-out}
-@keyframes modalin{from{transform:translateY(12px) scale(.98);opacity:.2}to{transform:translateY(0) scale(1);opacity:1}}
+.sheet{background:var(--bg);border:1px solid rgba(255,255,255,.62);border-radius:22px;width:min(760px,calc(100vw - 24px));max-height:min(90vh,960px);overflow-y:auto;overflow-x:hidden;box-shadow:0 28px 80px rgba(15,23,42,.28);animation:modalin .22s cubic-bezier(.22,1,.36,1)}
+@keyframes modalin{from{transform:translateY(10px) scale(.985);opacity:.2}to{transform:translateY(0) scale(1);opacity:1}}
 .sh-handle{display:none}
-.sh-hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 20px;position:sticky;top:0;background:rgba(242,242,247,.88);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:.5px solid var(--border);z-index:1}
-.sh-title{font-size:17px;font-weight:700}
-.sh-close{color:var(--blue);font-size:15px;font-weight:600;cursor:pointer;padding:4px 0 4px 12px}
-.sh-body{padding:16px}
+.sh-hdr{display:flex;align-items:center;justify-content:space-between;padding:15px 20px;position:sticky;top:0;background:rgba(245,246,248,.86);backdrop-filter:blur(18px) saturate(1.45);-webkit-backdrop-filter:blur(18px) saturate(1.45);border-bottom:1px solid rgba(60,60,67,.1);z-index:1}
+.sh-title{font-size:17px;font-weight:800;letter-spacing:0}
+.sh-close{color:var(--blue);font-size:15px;font-weight:750;cursor:pointer;padding:7px 0 7px 12px}
+.sh-body{padding:16px 16px 18px}
 .action-row{display:grid;grid-template-columns:1fr 1.45fr;gap:10px;margin:12px 0 4px}
+.action-row.single{grid-template-columns:1fr}
 .write-id-wrap{display:flex;gap:8px;align-items:stretch}
-.write-id-input{min-width:0;flex:1;border:1px solid var(--border);border-radius:14px;background:var(--surface);color:var(--blue);font-family:inherit;font-size:14px;font-weight:600;padding:0 12px;outline:none}
+.write-id-input{min-width:0;flex:1;border:1px solid rgba(60,60,67,.12);border-radius:13px;background:var(--surface);color:var(--blue);font-family:inherit;font-size:14px;font-weight:700;padding:0 12px;outline:none;min-height:44px;box-shadow:0 1px 0 rgba(255,255,255,.7) inset}
 .write-id-input:focus{border-color:rgba(0,122,255,.42);box-shadow:0 0 0 3px rgba(0,122,255,.12)}
 .write-id-wrap .btn{flex:0 0 auto;width:auto;min-width:116px}
-.btn-sm{padding:12px 14px;font-size:14px}
+.btn-sm{padding:0 14px;font-size:14px;min-height:44px}
 @media (max-width:640px){
   .ov{align-items:flex-end;padding:0}
   .sheet{width:100%;max-height:92vh;border-radius:20px 20px 0 0;animation:modalup .24s cubic-bezier(.32,1,.23,1)}
@@ -530,41 +589,46 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif;backg
 }
 
 /* Form */
-.fg{background:var(--surface);border-radius:14px;overflow:hidden;margin-bottom:4px;box-shadow:0 1px 0 var(--border)}
-.fr{display:flex;align-items:center;min-height:46px;padding:0 16px;border-bottom:.5px solid var(--border);gap:12px}
+.fg{background:var(--surface);border:1px solid rgba(60,60,67,.09);border-radius:var(--r);overflow:hidden;margin-bottom:4px;box-shadow:var(--shadow-soft)}
+.fr{display:flex;align-items:center;min-height:50px;padding:0 16px;border-bottom:1px solid rgba(60,60,67,.09);gap:12px}
 .fr:last-child{border-bottom:none}
-.fl{font-size:15px;color:var(--text);flex:1;padding:10px 0;white-space:nowrap}
-.fc{flex:0 0 auto;border:none;outline:none;background:transparent;font-size:15px;font-family:inherit;color:var(--blue);text-align:right;padding:10px 0;min-width:0;max-width:180px}
+.fl{font-size:15px;color:var(--text);flex:1;padding:10px 0;white-space:nowrap;font-weight:600}
+.fc{flex:0 0 auto;border:none;outline:none;background:transparent;font-size:15px;color:var(--blue);text-align:right;padding:10px 0;min-width:0;max-width:210px;font-weight:650}
 select.fc{-webkit-appearance:none;appearance:none;cursor:pointer}
-input.fc[type=text]{max-width:130px}
+input.fc[type=text],input.fc[type=password]{max-width:190px}
 input.fc[type=number]{max-width:76px}
 
 @media (max-width:920px){
-  .cnt{max-width:680px}
-  .ngrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+.cnt{max-width:760px}
+.ngrid{grid-template-columns:repeat(3,minmax(0,1fr))}
 }
 
 /* Buttons */
 .btns{display:flex;flex-direction:column;gap:10px;margin-top:20px}
-.btn{width:100%;padding:15px;border:none;border-radius:14px;font-size:16px;font-weight:600;font-family:inherit;cursor:pointer;letter-spacing:-.1px;transition:opacity .15s,transform .1s}
-.btn:active{opacity:.72;transform:scale(.98)}
-.btn-p{background:var(--blue);color:#fff}
-.btn-s{background:rgba(60,60,67,.1);color:var(--text)}
+.btn{width:100%;min-height:48px;padding:0 15px;border:none;border-radius:14px;font-size:16px;font-weight:750;cursor:pointer;letter-spacing:0;transition:opacity .14s ease,transform .1s ease,background .14s ease}
+.btn:active{opacity:.82;transform:scale(.985)}
+.btn-p{background:var(--blue);color:#fff;box-shadow:0 8px 18px rgba(10,132,255,.22)}
+.btn-p:active{background:var(--blue-press)}
+.btn-s{background:rgba(60,60,67,.09);color:var(--text)}
 /* Toggle switch */
 .sw{width:51px;height:31px;background:var(--text4);border-radius:16px;position:relative;transition:background .2s;flex-shrink:0;pointer-events:none}
 .sw::after{content:'';position:absolute;width:27px;height:27px;border-radius:50%;background:#fff;top:2px;left:2px;transition:left .2s;box-shadow:0 2px 4px rgba(0,0,0,.2)}
 .sw.on{background:var(--green)}.sw.on::after{left:22px}
 
 @media (max-width:640px){
-  .hdr{padding:0 14px}
-  .cnt{padding:14px 10px calc(24px + env(safe-area-inset-bottom))}
+  .hdr{height:60px;padding:0 14px}
+  .cnt{padding:16px 10px calc(24px + env(safe-area-inset-bottom))}
   .ibar{display:grid;grid-template-columns:auto 1fr;align-items:center}
-  .ibar-ip{grid-column:1/-1;padding-left:36px;font-size:13px}
-  .ngrid{grid-template-columns:1fr;gap:12px}
-  .node-card{aspect-ratio:auto;min-height:236px}
-  .node-card .nname{font-size:17px}
-  .node-card .ntype{font-size:13px}
-  .node-card .nbrand{font-size:12px}
+  .ibar-ip{grid-column:1/-1;margin-left:56px;justify-self:start;font-size:13px}
+  .ngrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .node-card{aspect-ratio:1/.94;min-height:0;padding:8px;border-radius:14px;gap:6px}
+  .node-media{height:46px;border-radius:10px}
+  .node-card .nname{font-size:16px}
+  .node-card .ntype{font-size:12px}
+  .node-card .nbrand{font-size:11px}
+  .node-card .nvalue{font-size:16px}
+  .node-card .nstatus{display:none}
+  .node-card .nacts{margin-top:0}
   .ov{align-items:flex-end;padding:0}
   .sheet{width:100%;max-height:92vh;border-radius:20px 20px 0 0;animation:modalup .24s cubic-bezier(.32,1,.23,1)}
   @keyframes modalup{from{transform:translateY(100%)}to{transform:translateY(0)}}
@@ -576,34 +640,44 @@ input.fc[type=number]{max-width:76px}
   .fr{display:block;padding:10px 16px 12px}
   .fl{display:block;padding:0 0 6px;white-space:normal}
   .fc{display:block;width:100%;max-width:none;padding:6px 0 0;text-align:left}
-  input.fc[type=text],input.fc[type=number]{max-width:none}
+  input.fc[type=text],input.fc[type=password],input.fc[type=number]{max-width:none}
+  .password-wrap{width:100%;max-width:none;justify-content:stretch}
+  .password-wrap .fc{padding:6px 0 0;text-align:left}
+  .nrow .fc{display:block;width:auto;max-width:132px;text-align:right;padding:0;flex:0 0 auto}
   .btns{padding-bottom:calc(8px + env(safe-area-inset-bottom))}
+}
+@media (max-width:360px){
+  .ngrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .node-card{aspect-ratio:1/.98}
+  .node-media{height:40px}
+  .node-card .nname{font-size:15px}
+  .node-card .nvalue{font-size:15px}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
 }
 </style>
 </head>
 <body>
 
 <div class="hdr">
-  <div class="hdr-icon">&#9878;</div>
+  <div class="hdr-icon">LC</div>
   <div class="hdr-text">
     <div class="hdr-title">BDP Hub</div>
     <div class="hdr-sub" id="hdr-sub">Chargement...</div>
   </div>
+  <button class="hdr-action" onclick="openNetworkModal()" aria-label="Parametres reseau">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5 13a10 10 0 0 1 14 0"></path>
+      <path d="M8.5 16.5a5 5 0 0 1 7 0"></path>
+      <path d="M12 20h.01"></path>
+    </svg>
+  </button>
 </div>
 
 <div class="cnt">
-  <div class="slbl">Reseau</div>
-  <div class="ibar">
-    <div class="ibar-icon">&#128246;</div>
-    <div class="ibar-body">
-      <div class="ibar-name" id="ssid-name">BDP-Hub</div>
-      <div class="ibar-hint">Connectez-vous pour configurer</div>
-    </div>
-    <div class="ibar-ip">192.168.4.1</div>
-  </div>
-
   <div class="shead">
-    <div class="slbl">Nodes</div>
+    <div class="slbl">Appareils</div>
     <div class="sactions">
       <button class="sbtn" id="scan-btn" onclick="startNodeScan()" aria-label="Rechercher des nodes">
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -614,6 +688,12 @@ input.fc[type=number]{max-width:76px}
         </svg>
         <span id="scan-btn-label">Rechercher</span>
       </button>
+      <button class="sbtn sbtn-icon" onclick="openNewProfileConf()" aria-label="Ajouter un profil">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 5v14"></path>
+          <path d="M5 12h14"></path>
+        </svg>
+      </button>
     </div>
   </div>
   <div class="ngrid" id="nlist">
@@ -623,7 +703,7 @@ input.fc[type=number]{max-width:76px}
   <div class="slbl">Options</div>
   <div class="ncard">
     <div class="nrow" onclick="toggleSound()">
-      <div class="avt" style="background:#F0FFF4;color:#1A7A35;font-size:19px">&#9835;</div>
+      <div class="avt" style="background:#EAFBF0;color:#176C2D;font-size:12px">SON</div>
       <div class="ninfo">
         <div class="nname">Son a la reception</div>
         <div class="nmeta"><span id="snd-lbl">Active</span></div>
@@ -631,7 +711,7 @@ input.fc[type=number]{max-width:76px}
       <div class="sw on" id="sw-snd"></div>
     </div>
     <div class="nrow">
-      <div class="avt" style="background:#EEF4FF;color:#2258B8;font-size:19px">&#9834;</div>
+      <div class="avt" style="background:#EAF3FF;color:#0A55B7;font-size:12px">USB</div>
       <div class="ninfo">
         <div class="nname">Retour reponse serie</div>
         <div class="nmeta"><span id="sr-lbl">Bip + vibration</span></div>
@@ -644,12 +724,26 @@ input.fc[type=number]{max-width:76px}
       </select>
     </div>
     <div class="nrow" onclick="purgeNodes()">
-      <div class="avt" style="background:#FFF3F2;color:#C62828;font-size:18px">&#10006;</div>
+      <div class="avt" style="background:#FFF1F0;color:#C51C14;font-size:12px">DEL</div>
       <div class="ninfo">
         <div class="nname">Purge des nodes</div>
         <div class="nmeta">Efface la liste du knob et reinitialise les Atom en ligne</div>
       </div>
     </div>
+    <div class="nrow">
+      <div class="avt" style="background:#FFF7E8;color:#9A5B00;font-size:12px">OTA</div>
+      <div class="ninfo">
+        <div class="nname">Mise a jour firmware</div>
+        <div class="nmeta">Envoyer un fichier .bin au knob</div>
+      </div>
+    </div>
+    <div class="ota-picker">
+      <input id="ota-file" type="file" accept=".bin,application/octet-stream">
+    </div>
+    <div class="network-actions">
+      <button class="btn btn-s btn-sm" id="ota-btn" onclick="uploadFirmware()">Installer la mise a jour</button>
+    </div>
+    <div class="ota-status" id="ota-status">Le knob redemarre automatiquement apres une mise a jour reussie.</div>
   </div>
 </div>
 
@@ -698,6 +792,14 @@ input.fc[type=number]{max-width:76px}
         <div class="fr">
           <label class="fl">ID balance</label>
           <input class="fc" id="c-balance-id" type="text" maxlength="20" placeholder="ID balance" oninput="syncLabelFromBalanceId()">
+        </div>
+        <div class="fr">
+          <label class="fl">Reponse ?ID</label>
+          <input class="fc" id="c-id-raw" type="text" maxlength="31" placeholder="ID,0000000">
+        </div>
+        <div class="fr">
+          <label class="fl">Numero serie</label>
+          <input class="fc" id="c-serial" type="text" maxlength="23" placeholder="Numero serie">
         </div>
         <div class="fr">
           <label class="fl">Type</label>
@@ -807,6 +909,48 @@ input.fc[type=number]{max-width:76px}
   </div>
 </div>
 
+<div class="ov" id="net-ov">
+  <div class="sheet">
+    <div class="sh-handle"></div>
+    <div class="sh-hdr">
+      <span class="sh-title">Reseau</span>
+      <span class="sh-close" onclick="closeNetworkModal()">Fermer</span>
+    </div>
+    <div class="sh-body">
+      <div class="ibar" style="margin-bottom:12px">
+        <div class="ibar-icon">WiFi</div>
+        <div class="ibar-body">
+          <div class="ibar-name" id="ssid-name">BDP-Hub</div>
+          <div class="ibar-hint">Connectez-vous pour configurer</div>
+        </div>
+        <div class="ibar-ip">192.168.4.1</div>
+      </div>
+      <div class="fg">
+        <div class="fr">
+          <label class="fl">Nom du reseau</label>
+          <input class="fc" id="ap-ssid" type="text" maxlength="31" placeholder="BDP-Hub">
+        </div>
+        <div class="fr">
+          <label class="fl">Mot de passe</label>
+          <div class="password-wrap">
+            <input class="fc" id="ap-pass" type="password" maxlength="63" placeholder="8 caracteres min.">
+            <button class="pw-eye" type="button" onclick="toggleApPassword()" aria-label="Afficher le mot de passe" id="ap-pass-eye">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z"></path>
+                <circle cx="12" cy="12" r="3"></circle>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="btns">
+        <button class="btn btn-p" onclick="saveNetworkSettings()">Sauvegarder</button>
+        <button class="btn btn-s" onclick="closeNetworkModal()">Annuler</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const PR={
   0:{baud:2400,parity:1,dataBits:7,stopBits:1,pollCmd:'Q', lineTimeout:300,zeroCmd:'Z'},
@@ -897,7 +1041,9 @@ function syncWriteBalanceId(){
 function setMettlerWriteVisibility(brand){
   const isMettler=parseInt(brand,10)===1;
   const wrap=document.getElementById('mettler-write-wrap');
+  const row=wrap?wrap.closest('.action-row'):null;
   if(wrap) wrap.style.display=isMettler?'block':'none';
+  if(row) row.classList.toggle('single',!isMettler);
   if(!isMettler){
     document.getElementById('c-balance-id-write').value='';
   }else{
@@ -979,7 +1125,6 @@ async function loadNodes(force=false){
     }
     const n=nodes.length;
     document.getElementById('hdr-sub').textContent=n+' node'+(n!==1?'s':'');
-    document.getElementById('ssid-name').textContent='BDP-Hub';
   }catch(e){
     if(Date.now()<suppressNodeErrorsUntil) return;
     const msg=String(e&&e.message?e.message:e);
@@ -1020,6 +1165,98 @@ async function loadSettings(){
   }catch(e){}
 }
 
+async function loadNetworkSettings(){
+  try{
+    const r=await apiFetch('/api/network');
+    if(!r.ok) return;
+    const d=await r.json();
+    document.getElementById('ssid-name').textContent=d.ssid||'BDP-Hub';
+    document.getElementById('ap-ssid').value=d.ssid||'';
+    document.getElementById('ap-pass').value=d.password||'';
+  }catch(e){}
+}
+
+async function saveNetworkSettings(){
+  const ssid=(document.getElementById('ap-ssid').value||'').trim();
+  const password=document.getElementById('ap-pass').value||'';
+  if(!ssid){
+    toast('Renseignez le nom du reseau',false);
+    return;
+  }
+  if(password && (password.length<8 || password.length>63)){
+    toast('Mot de passe: 8 a 63 caracteres',false);
+    return;
+  }
+  try{
+    const r=await apiFetch('/api/network',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ssid,password})},5000);
+    const d=await parseJsonResponse(r);
+    toast(r.ok?(d.message||'Reseau sauvegarde'):(d.error||'Erreur reseau'),r.ok);
+    if(r.ok){
+      document.getElementById('ssid-name').textContent=ssid;
+      setTimeout(()=>toast('Reconnectez-vous a '+ssid,true),1200);
+    }
+  }catch(e){toast('Erreur reseau',false);}
+}
+
+function toggleApPassword(){
+  const input=document.getElementById('ap-pass');
+  const btn=document.getElementById('ap-pass-eye');
+  const show=input.type==='password';
+  input.type=show?'text':'password';
+  btn.setAttribute('aria-label',show?'Masquer le mot de passe':'Afficher le mot de passe');
+  btn.style.color=show?'var(--blue)':'var(--text3)';
+}
+
+function uploadFirmware(){
+  const input=document.getElementById('ota-file');
+  const btn=document.getElementById('ota-btn');
+  const status=document.getElementById('ota-status');
+  const file=input&&input.files&&input.files[0];
+  if(!file){
+    toast('Choisissez un fichier .bin',false);
+    return;
+  }
+  if(!file.name.toLowerCase().endsWith('.bin')){
+    toast('Le fichier doit etre un .bin',false);
+    return;
+  }
+  const data=new FormData();
+  data.append('firmware',file,file.name);
+  const xhr=new XMLHttpRequest();
+  btn.disabled=true;
+  btn.textContent='Envoi 0%';
+  status.textContent='Upload en cours... ne coupez pas le knob.';
+  xhr.upload.onprogress=e=>{
+    if(e.lengthComputable){
+      const pct=Math.max(1,Math.min(99,Math.round((e.loaded/e.total)*100)));
+      btn.textContent='Envoi '+pct+'%';
+    }
+  };
+  xhr.onload=()=>{
+    btn.disabled=false;
+    let d={};
+    try{d=JSON.parse(xhr.responseText||'{}');}catch(e){}
+    if(xhr.status>=200 && xhr.status<300){
+      btn.textContent='Redemarrage...';
+      status.textContent=d.message||'Mise a jour installee. Redemarrage du knob...';
+      toast('Mise a jour installee',true);
+      setTimeout(()=>{btn.disabled=false;btn.textContent='Installer la mise a jour';},9000);
+    }else{
+      btn.textContent='Installer la mise a jour';
+      status.textContent=d.error||'Erreur pendant la mise a jour';
+      toast(status.textContent,false);
+    }
+  };
+  xhr.onerror=()=>{
+    btn.disabled=false;
+    btn.textContent='Installer la mise a jour';
+    status.textContent='Erreur reseau pendant l upload';
+    toast('Erreur reseau',false);
+  };
+  xhr.open('POST','/api/ota');
+  xhr.send(data);
+}
+
 function setSnd(on){
   soundOn=on;
   document.getElementById('sw-snd').className='sw'+(on?' on':'');
@@ -1057,7 +1294,6 @@ async function setSerialReplyModeFromSelect(){
 
 function render(){
   const el=document.getElementById('nlist');
-  const addCard='<div class="node-card node-add" onclick="openNewProfileConf()"><div class="plus">+</div><div class="ninfo"><div class="nname">Nouveau profil</div><div class="nbrand">Ouvre les parametres pour creer un profil</div></div></div>';
   const profileCards=profiles.map((p,i)=>{
     const label=p&&p.label?p.label:'';
     const match=label.match(/(02|03|04|05|06)/);
@@ -1073,6 +1309,7 @@ function render(){
       +     '<div class="nname">'+(p.label||p.name||'Profil')+'</div>'
       +     '<div class="ntype">'+(p.type||'Type non renseigne')+'</div>'
       +     '<div class="nbrand">'+(p.brandName||'Marque non renseignee')+'</div>'
+      +     '<div class="nvalue muted">Profil</div>'
       +     '<div class="nstatus"><span class="nbadge boff">Profil</span></div>'
       +   '</div>'
       +   '<div class="nacts">'
@@ -1086,19 +1323,20 @@ function render(){
       + '</div>';
   }).join('');
   if(!nodes.length && !profiles.length){
-    el.innerHTML=addCard;
+    el.innerHTML='<div class="empty"><div class="empty-ttl">Aucun appareil</div><div class="empty-sub">Utilisez Rechercher ou le bouton + pour ajouter un profil.</div></div>';
     return;
   }
-  el.innerHTML=addCard+profileCards+nodes.map(n=>{
+  el.innerHTML=profileCards+nodes.map(n=>{
     const c=n.configKnown?n.config:null;
     const cdoId=inferCdoId(n);
     const img=IMG_CDO[cdoId]||'';
     const identifier=n.label||((n.balanceId&&n.balanceId!=='?')?('CDO '+n.balanceId):'');
     const type=n.type||n.typeName||'';
-    const mac=n.mac||'';
     const brand=c?c.brandName:'';
     const firmware=c&&c.firmware?c.firmware:'';
     const brandLine=firmware?(brand?brand+' • '+firmware:firmware):brand;
+    const value=(n.lastValue&&String(n.lastValue).trim())?String(n.lastValue).trim():'';
+    const valueHtml=value?('<div class="nvalue">'+esc(value)+'</div>'):'<div class="nvalue muted">---</div>';
     const mediaHtml=img
       ?('<div class="node-media"><img class="node-img" src="'+img+'" alt="'+(n.label||n.type||n.typeName||n.name||'Balance')+'"></div>')
       :('<div class="node-media"><div class="node-mark">'+(brand||'Profil client')+'</div></div>');
@@ -1110,7 +1348,7 @@ function render(){
       +     '<div class="nname">'+(identifier||'CDO ?')+'</div>'
       +     '<div class="ntype">'+(type||'Type non renseigne')+'</div>'
       +     '<div class="nbrand">'+(brandLine||'Marque non renseignee')+'</div>'
-      +     '<div class="nbrand">'+mac+'</div>'
+      +     valueHtml
       +     '<div class="nstatus"><span class="nbadge '+(n.online?'bon':'boff')+'">'+(n.online?'En ligne':'Hors ligne')+'</span></div>'
       +   '</div>'
       +   '<div class="nacts">'
@@ -1138,9 +1376,12 @@ function openConf(id){
   document.getElementById('c-balance-id').value=normalizedBalanceIdValue(n.balanceId||identifier);
   document.getElementById('c-balance-id-write').value=normalizedBalanceIdValue(n.balanceId||identifier);
   syncWriteBalanceId();
+  setFieldValue('c-id-raw',n.balanceIdRaw||'');
+  setFieldValue('c-serial',n.serial||'');
   document.getElementById('c-name').value=n.type||n.typeName||'';
   document.getElementById('c-node-name').value=n.name||n.nodeName||'';
   sv('c-brand',n.configKnown?c.brand:0);
+  setMettlerWriteVisibility(n.configKnown?c.brand:0);
   sv('c-baud',c.baud);sv('c-par',c.parity);
   sv('c-db',c.dataBits);sv('c-sb',c.stopBits);
   document.getElementById('c-rx').value=c.rxPin??5;
@@ -1169,6 +1410,8 @@ function openNewProfileConf(){
   document.getElementById('c-balance-id').value='';
   document.getElementById('c-balance-id-write').value='';
   syncWriteBalanceId();
+  setFieldValue('c-id-raw','');
+  setFieldValue('c-serial','');
   document.getElementById('c-name').value='';
   sv('c-brand',0);
   onBrand();
@@ -1197,8 +1440,11 @@ function openProfileConfByIndex(index){
   document.getElementById('c-balance-id').value=normalizedBalanceIdValue((p.balanceId||p.label||''));
   document.getElementById('c-balance-id-write').value=normalizedBalanceIdValue((p.balanceId||p.label||''));
   syncWriteBalanceId();
+  setFieldValue('c-id-raw','');
+  setFieldValue('c-serial','');
   document.getElementById('c-name').value=p.type||'';
   sv('c-brand',p.brand??0);
+  setMettlerWriteVisibility(p.brand??0);
   sv('c-baud',p.baud);
   sv('c-par',p.parity);
   sv('c-db',p.dataBits);
@@ -1235,6 +1481,7 @@ function syncProfileNameFromSelect(){
 }
 
 function sv(id,v){const e=document.getElementById(id);if(e)e.value=String(v);}
+function setFieldValue(id,value){const e=document.getElementById(id);if(e)e.value=value||'';}
 function setTransportLock(locked, firmware){
   const ids=['c-brand','c-baud','c-par','c-db','c-sb','c-rx','c-tx','c-sw','c-cmd','c-to','c-zero'];
   ids.forEach(id=>{const el=document.getElementById(id); if(el) el.disabled=!!locked;});
@@ -1245,6 +1492,11 @@ function setTransportLock(locked, firmware){
   }
 }
 function closeSheet(){document.getElementById('ov').classList.remove('open');}
+function openNetworkModal(){
+  loadNetworkSettings();
+  document.getElementById('net-ov').classList.add('open');
+}
+function closeNetworkModal(){document.getElementById('net-ov').classList.remove('open');}
 function esc(s){return String(s||'').replace(/[&<>"]/g,m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[m]));}
 
 function onBrand(){
@@ -1264,22 +1516,34 @@ async function readBalanceId(){
     return;
   }
   try{
-    pauseNodeErrors(5000);
-    const r=await apiFetch('/api/balance-id/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,brand:parseInt(document.getElementById('c-brand').value)})},5000);
+    const brand=parseInt(document.getElementById('c-brand').value);
+    pauseNodeErrors(9000);
+    const r=await apiFetch('/api/balance-id/read',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,brand})},9000);
     const d=await r.json();
     if(!r.ok){
       toast(d.error||'Lecture impossible',false);
       return;
+    }
+    setFieldValue('c-id-raw',d.idRaw||d.raw||'');
+    setFieldValue('c-serial',d.serial||'');
+    if(d.type){
+      document.getElementById('c-name').value=d.type;
     }
     if(d.balanceId){
       const clientId=normalizedBalanceIdValue(d.balanceId);
       if(clientId){
         document.getElementById('c-balance-id').value=clientId;
         document.getElementById('c-label').value='CDO '+clientId;
+      }else{
+        document.getElementById('c-balance-id').value=typedMettlerWriteIdValue(d.balanceId);
       }
       document.getElementById('c-balance-id-write').value=typedMettlerWriteIdValue(d.balanceId);
+    }else{
+      document.getElementById('c-balance-id').value='';
+      document.getElementById('c-label').value='';
+      document.getElementById('c-balance-id-write').value='';
     }
-    toast(d.message||('ID lu: '+(d.balanceId||d.raw||'?')),true);
+    toast(d.message||('Infos lues: '+(d.balanceId||d.idRaw||d.raw||'aucun ID')),true);
     await loadNodes(true);
   }catch(e){toast('Erreur reseau',false);}
 }
@@ -1317,14 +1581,19 @@ async function saveSheet(){
 }
 
 function currentConfigPayload(){
-  const balanceId=normalizedBalanceIdValue(document.getElementById('c-balance-id').value);
-  if(balanceId){
-    document.getElementById('c-balance-id').value=balanceId;
-    document.getElementById('c-label').value='CDO '+balanceId;
+  const labelValue=document.getElementById('c-label').value.trim();
+  const rawBalanceId=typedMettlerWriteIdValue(document.getElementById('c-balance-id').value).trim();
+  const clientBalanceId=normalizedBalanceIdValue(rawBalanceId)||normalizedBalanceIdValue(labelValue);
+  const savedBalanceId=rawBalanceId||clientBalanceId;
+  document.getElementById('c-balance-id').value=savedBalanceId;
+  if(clientBalanceId){
+    document.getElementById('c-label').value='CDO '+clientBalanceId;
   }
   return {
     nodeName:document.getElementById('c-node-name').value.trim(),
-    balanceId,
+    balanceId:savedBalanceId,
+    balanceIdRaw:document.getElementById('c-id-raw').value.trim(),
+    serial:document.getElementById('c-serial').value.trim(),
     label:document.getElementById('c-label').value.trim(),
     name:document.getElementById('c-name').value.trim(),
     brand:parseInt(document.getElementById('c-brand').value),
@@ -1504,6 +1773,7 @@ function toast(msg,ok){
 document.getElementById('ov').addEventListener('click',e=>{if(e.target===document.getElementById('ov'))closeSheet();});
 loadNodes(true);
 loadSettings();
+loadNetworkSettings();
 loadProfiles();
 setInterval(()=>loadNodes(false),4000);
 </script>
@@ -1580,6 +1850,13 @@ void saveNodes() {
     strncpy(sm.displayLabel, nodes[i].displayLabel, sizeof(sm.displayLabel) - 1);
     prefs.putBytes(mkey, &sm, sizeof(sm));
 
+    char ikey[8];
+    snprintf(ikey, sizeof(ikey), "i%d", i);
+    stored_node_identity_t si = {};
+    strncpy(si.balanceSerial, nodes[i].balanceSerial, sizeof(si.balanceSerial) - 1);
+    strncpy(si.balanceIdRaw, nodes[i].balanceIdRaw, sizeof(si.balanceIdRaw) - 1);
+    prefs.putBytes(ikey, &si, sizeof(si));
+
     if (nodes[i].configKnown) {
       char ckey[8];
       snprintf(ckey, sizeof(ckey), "c%d", i);
@@ -1622,7 +1899,11 @@ void loadNodes() {
       nodes[i].active = false;
       nodes[i].persisted = true;
       nodes[i].balanceId[0] = 0;
+      nodes[i].balanceSerial[0] = 0;
+      nodes[i].balanceIdRaw[0] = 0;
       nodes[i].displayLabel[0] = 0;
+      nodes[i].lastValue[0] = 0;
+      nodes[i].lastValueTime = 0;
 
       char mkey[8];
       snprintf(mkey, sizeof(mkey), "m%d", i);
@@ -1634,9 +1915,19 @@ void loadNodes() {
         nodes[i].displayLabel[sizeof(nodes[i].displayLabel) - 1] = 0;
       }
 
+      char ikey[8];
+      snprintf(ikey, sizeof(ikey), "i%d", i);
+      stored_node_identity_t si;
+      if (prefs.getBytes(ikey, &si, sizeof(si)) == sizeof(si)) {
+        strncpy(nodes[i].balanceSerial, si.balanceSerial, sizeof(nodes[i].balanceSerial) - 1);
+        nodes[i].balanceSerial[sizeof(nodes[i].balanceSerial) - 1] = 0;
+        strncpy(nodes[i].balanceIdRaw, si.balanceIdRaw, sizeof(nodes[i].balanceIdRaw) - 1);
+        nodes[i].balanceIdRaw[sizeof(nodes[i].balanceIdRaw) - 1] = 0;
+      }
+
       esp_now_peer_info_t peer = {};
       memcpy(peer.peer_addr, sn.mac, 6);
-      peer.channel = 0;
+      peer.channel = AP_CHANNEL;
       peer.encrypt = false;
       esp_now_add_peer(&peer);
 
@@ -1785,6 +2076,10 @@ int upsertNode(const uint8_t* mac, const char* name, uint8_t id) {
   nodes[idx].lineTimeout = 300;
   nodes[idx].balanceId[0] = 0;
   nodes[idx].displayLabel[0] = 0;
+  nodes[idx].balanceSerial[0] = 0;
+  nodes[idx].balanceIdRaw[0] = 0;
+  nodes[idx].lastValue[0] = 0;
+  nodes[idx].lastValueTime = 0;
   strlcpy(nodes[idx].zeroCmd, "Z", sizeof(nodes[idx].zeroCmd));
   nodes[idx].capacity = 5000.0f;
   nodes[idx].resolution = 0.01f;
@@ -1794,7 +2089,7 @@ int upsertNode(const uint8_t* mac, const char* name, uint8_t id) {
 
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, mac, 6);
-  peer.channel = 0;
+  peer.channel = AP_CHANNEL;
   peer.encrypt = false;
   esp_now_add_peer(&peer);
 
@@ -2039,6 +2334,59 @@ bool extractClientBalanceId(const char* raw, char* out, size_t outSize) {
   return false;
 }
 
+static bool isAllZeroIdentityValue(const char* value) {
+  if (!value || !*value) return false;
+  bool hasDigit = false;
+  for (size_t i = 0; value[i]; i++) {
+    char c = value[i];
+    if (c == ' ' || c == '-' || c == '_' || c == '.' || c == ',') continue;
+    if (c < '0' || c > '9') return false;
+    if (c != '0') return false;
+    hasDigit = true;
+  }
+  return hasDigit;
+}
+
+static void compactAdIdentityLine(const char* raw, char* out, size_t outSize) {
+  if (!out || outSize == 0) return;
+  out[0] = 0;
+  if (!raw) return;
+  bool prevSpace = true;
+  size_t o = 0;
+  for (size_t i = 0; raw[i] && o < outSize - 1; i++) {
+    char c = raw[i];
+    if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    if (c == ' ') {
+      if (!prevSpace && o > 0) out[o++] = ' ';
+      prevSpace = true;
+    } else {
+      out[o++] = c;
+      prevSpace = false;
+    }
+  }
+  while (o > 0 && out[o - 1] == ' ') o--;
+  out[o] = 0;
+}
+
+static bool extractAdIdentityValue(const char* raw, const char* prefix, char* out, size_t outSize) {
+  if (!out || outSize == 0) return false;
+  out[0] = 0;
+  if (!raw || !*raw) return false;
+  char compact[96];
+  compactAdIdentityLine(raw, compact, sizeof(compact));
+  const char* value = compact;
+  if (prefix && *prefix) {
+    size_t prefixLen = strlen(prefix);
+    if (strncasecmp(compact, prefix, prefixLen) == 0) {
+      value = compact + prefixLen;
+      while (*value == ',' || *value == ':' || *value == '=' || *value == ' ') value++;
+    }
+  }
+  if (!*value) return false;
+  strlcpy(out, value, outSize);
+  return true;
+}
+
 bool sanitizeMettlerWriteId(const char* raw, char* out, size_t outSize) {
   if (!raw || !out || outSize < 2) return false;
   size_t n = 0;
@@ -2099,6 +2447,8 @@ static void normalizeNodeIdentity(int idx) {
       extractClientBalanceId(nodes[idx].balanceId, parsedId, sizeof(parsedId))) {
     strlcpy(nodes[idx].balanceId, parsedId, sizeof(nodes[idx].balanceId));
     setNodeDisplayLabel(idx);
+  } else if (nodes[idx].displayLabel[0] && strcmp(nodes[idx].displayLabel, "CDO ?") != 0) {
+    nodes[idx].balanceId[0] = 0;
   }
 }
 
@@ -2106,7 +2456,7 @@ void setNodeDisplayLabel(int idx) {
   if (idx < 0 || idx >= nodeCount) return;
   if (isKnownBalanceId(nodes[idx].balanceId)) {
     snprintf(nodes[idx].displayLabel, sizeof(nodes[idx].displayLabel), "CDO %s", nodes[idx].balanceId);
-  } else {
+  } else if (strcmp(nodes[idx].displayLabel, "CDO ?") == 0) {
     nodes[idx].displayLabel[0] = 0;
   }
 }
@@ -2201,12 +2551,60 @@ const char* nodeBalanceType(int idx) {
 // =====================================================
 // Paramètres hub (NVS)
 // =====================================================
+void setDefaultNetworkSettings() {
+  uint32_t chip = (uint32_t)(ESP.getEfuseMac() >> 32);
+  snprintf(apSsid, sizeof(apSsid), "%s%04X", AP_SSID_PREFIX, chip & 0xFFFF);
+  strlcpy(apPass, AP_PASS, sizeof(apPass));
+}
+
+void sanitizeNetworkSettings() {
+  if (!apSsid[0]) {
+    setDefaultNetworkSettings();
+    return;
+  }
+  size_t passLen = strlen(apPass);
+  if (passLen > 0 && passLen < 8) {
+    strlcpy(apPass, AP_PASS, sizeof(apPass));
+  }
+}
+
+bool applyWifiAp() {
+  sanitizeNetworkSettings();
+  WiFi.mode(WIFI_AP);
+  WiFi.setAutoReconnect(false);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.softAPdisconnect(false);
+  delay(80);
+  IPAddress localIp(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(localIp, gateway, subnet);
+  bool ok = apPass[0] ? WiFi.softAP(apSsid, apPass, AP_CHANNEL)
+                      : WiFi.softAP(apSsid, nullptr, AP_CHANNEL);
+  delay(50);
+  snprintf(apIp, sizeof(apIp), "%s", WiFi.softAPIP().toString().c_str());
+  hubLogPrintf("@00 WIFI_AP %s ssid=%s ip=%s\n", ok ? "OK" : "FAIL", apSsid, apIp);
+  displayDirty = true;
+  return ok;
+}
+
 void loadSettings() {
+  setDefaultNetworkSettings();
   prefs.begin("bdphub", true);
   soundEnabled = prefs.getBool("snd_en", true);
   serialReplyBeepEnabled = prefs.getBool("sr_beep", true);
   serialReplyHapticEnabled = prefs.getBool("sr_haptic", true);
+  String savedSsid = prefs.getString("ap_ssid", apSsid);
+  String savedPass = prefs.getString("ap_pass", apPass);
+  if (savedSsid.length() > 0 && savedSsid.length() < sizeof(apSsid)) {
+    strlcpy(apSsid, savedSsid.c_str(), sizeof(apSsid));
+  }
+  if (savedPass.length() < sizeof(apPass)) {
+    strlcpy(apPass, savedPass.c_str(), sizeof(apPass));
+  }
   prefs.end();
+  sanitizeNetworkSettings();
 }
 
 void saveSettings() {
@@ -2214,6 +2612,16 @@ void saveSettings() {
   prefs.putBool("snd_en", soundEnabled);
   prefs.putBool("sr_beep", serialReplyBeepEnabled);
   prefs.putBool("sr_haptic", serialReplyHapticEnabled);
+  prefs.putString("ap_ssid", apSsid);
+  prefs.putString("ap_pass", apPass);
+  prefs.end();
+}
+
+void resetNetworkSettingsToDefault() {
+  setDefaultNetworkSettings();
+  prefs.begin("bdphub", false);
+  prefs.putString("ap_ssid", apSsid);
+  prefs.putString("ap_pass", apPass);
   prefs.end();
 }
 
@@ -2260,7 +2668,7 @@ void handleFavicon() {
 void handleApiNodes() {
   webServer.sendHeader("Access-Control-Allow-Origin", "*");
   String body;
-  body.reserve((nodeCount * 768) + 16);
+  body.reserve((nodeCount * 912) + 16);
   body += '[';
   for (int i = 0; i < nodeCount; i++) {
     if (i > 0) body += ',';
@@ -2281,6 +2689,14 @@ void handleApiNodes() {
     appendJsonEscaped(body, nodes[i].displayLabel);
     body += ",\"balanceId\":";
     appendJsonEscaped(body, nodes[i].balanceId);
+    body += ",\"balanceIdRaw\":";
+    appendJsonEscaped(body, nodes[i].balanceIdRaw);
+    body += ",\"serial\":";
+    appendJsonEscaped(body, nodes[i].balanceSerial);
+    body += ",\"lastValue\":";
+    appendJsonEscaped(body, nodes[i].lastValue);
+    body += ",\"lastValueAge\":";
+    body += nodes[i].lastValueTime ? String((millis() - nodes[i].lastValueTime) / 1000UL) : "0";
     body += ",\"online\":";
     body += nodes[i].active ? "true" : "false";
     body += ",\"ago\":";
@@ -2365,15 +2781,19 @@ void handleApiConfigSet() {
     }
   }
   if (doc.containsKey("balanceId")) {
-    char rawBalanceId[20];
+    char rawBalanceId[21];
     strlcpy(rawBalanceId, doc["balanceId"] | "", sizeof(rawBalanceId));
     if (extractClientBalanceId(rawBalanceId, nodes[idx].balanceId, sizeof(nodes[idx].balanceId))) {
       setNodeDisplayLabel(idx);
     } else if (rawBalanceId[0]) {
       strlcpy(nodes[idx].balanceId, rawBalanceId, sizeof(nodes[idx].balanceId));
       setNodeDisplayLabel(idx);
+    } else {
+      nodes[idx].balanceId[0] = 0;
     }
   }
+  if (doc.containsKey("balanceIdRaw")) strlcpy(nodes[idx].balanceIdRaw, doc["balanceIdRaw"] | "", sizeof(nodes[idx].balanceIdRaw));
+  if (doc.containsKey("serial"))       strlcpy(nodes[idx].balanceSerial, doc["serial"] | "", sizeof(nodes[idx].balanceSerial));
   if (doc.containsKey("nodeName"))    strlcpy(nodes[idx].nodeName, doc["nodeName"], sizeof(nodes[idx].nodeName));
   if (doc.containsKey("name"))        strlcpy(nodes[idx].typeName, doc["name"], sizeof(nodes[idx].typeName));
   if (doc.containsKey("brand"))       nodes[idx].brand     = doc["brand"];
@@ -2479,33 +2899,88 @@ void handleApiBalanceIdRead() {
     return;
   }
   uint8_t brand = doc["brand"] | nodes[idx].brand;
-  const char* cmd = "";
-  if (brand == BRAND_AD) cmd = "?ID";
-  else if (brand == BRAND_METTLER) cmd = "I10";
-  else {
+  if (brand != BRAND_AD && brand != BRAND_METTLER) {
     webServer.send(400, "application/json", "{\"error\":\"brand_not_supported\"}");
     return;
   }
 
-  char raw[128];
-  if (!sendBalanceCmdAndWait(idx, cmd, raw, sizeof(raw), 1800)) {
-    webServer.send(504, "application/json", "{\"error\":\"read_timeout\"}");
-    return;
-  }
+  char raw[128] = "";
+  char idRaw[128] = "";
+  char snRaw[128] = "";
+  char tnRaw[128] = "";
   char balanceId[21] = "";
-  bool ok = parseBalanceIdFromReply(brand, raw, balanceId, sizeof(balanceId));
+  char serial[24] = "";
+  char typeName[32] = "";
+  bool ok = false;
+
+  if (brand == BRAND_AD) {
+    if (!sendBalanceCmdAndWait(idx, "?ID", idRaw, sizeof(idRaw), 1800)) {
+      webServer.send(504, "application/json", "{\"error\":\"read_timeout\"}");
+      return;
+    }
+    strlcpy(raw, idRaw, sizeof(raw));
+    char adIdValue[32] = "";
+    extractAdIdentityValue(idRaw, "ID", adIdValue, sizeof(adIdValue));
+    ok = parseBalanceIdFromReply(brand, idRaw, balanceId, sizeof(balanceId));
+    if (ok && isAllZeroIdentityValue(adIdValue)) {
+      ok = false;
+      balanceId[0] = 0;
+    }
+
+    if (sendBalanceCmdAndWait(idx, "?SN", snRaw, sizeof(snRaw), 1400)) {
+      extractAdIdentityValue(snRaw, "SN", serial, sizeof(serial));
+    }
+    if (sendBalanceCmdAndWait(idx, "?TN", tnRaw, sizeof(tnRaw), 1400)) {
+      extractAdIdentityValue(tnRaw, "TN", typeName, sizeof(typeName));
+    }
+
+    strlcpy(nodes[idx].balanceIdRaw, idRaw, sizeof(nodes[idx].balanceIdRaw));
+    strlcpy(nodes[idx].balanceSerial, serial, sizeof(nodes[idx].balanceSerial));
+    if (typeName[0] && strcmp(typeName, "?") != 0) {
+      strlcpy(nodes[idx].typeName, typeName, sizeof(nodes[idx].typeName));
+    }
+  } else {
+    if (!sendBalanceCmdAndWait(idx, "I10", raw, sizeof(raw), 1800)) {
+      webServer.send(504, "application/json", "{\"error\":\"read_timeout\"}");
+      return;
+    }
+    strlcpy(idRaw, raw, sizeof(idRaw));
+    ok = parseBalanceIdFromReply(brand, raw, balanceId, sizeof(balanceId));
+    strlcpy(nodes[idx].balanceIdRaw, raw, sizeof(nodes[idx].balanceIdRaw));
+  }
+
   if (ok) {
     char clientId[21] = "";
     if (extractClientBalanceId(balanceId, clientId, sizeof(clientId))) {
       strlcpy(nodes[idx].balanceId, clientId, sizeof(nodes[idx].balanceId));
       setNodeDisplayLabel(idx);
-      saveNodes();
+    } else {
+      nodes[idx].balanceId[0] = 0;
+      nodes[idx].displayLabel[0] = 0;
     }
+  } else {
+    nodes[idx].balanceId[0] = 0;
+    nodes[idx].displayLabel[0] = 0;
   }
-  String body = "{\"status\":\"ok\",\"message\":\"ID lu\",\"raw\":";
+  applyClientBrandMapping(idx);
+  saveNodes();
+
+  String body = "{\"status\":\"ok\",\"message\":";
+  appendJsonEscaped(body, ok ? "Infos balance lues" : "Infos lues, aucun ID CDO renseigne");
+  body += ",\"raw\":";
   appendJsonEscaped(body, raw);
+  body += ",\"idRaw\":";
+  appendJsonEscaped(body, idRaw);
+  body += ",\"snRaw\":";
+  appendJsonEscaped(body, snRaw);
+  body += ",\"tnRaw\":";
+  appendJsonEscaped(body, tnRaw);
   body += ",\"balanceId\":";
   appendJsonEscaped(body, ok ? balanceId : "");
+  body += ",\"serial\":";
+  appendJsonEscaped(body, serial[0] ? serial : nodes[idx].balanceSerial);
+  body += ",\"type\":";
+  appendJsonEscaped(body, typeName[0] ? typeName : nodes[idx].typeName);
   body += "}";
   webServer.send(200, "application/json", body);
 }
@@ -2586,6 +3061,95 @@ void handleApiSettingsSet() {
   } else {
     webServer.send(400, "application/json", "{\"error\":\"json_parse\"}");
   }
+}
+
+void handleApiNetwork() {
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  String body = "{\"ssid\":";
+  appendJsonEscaped(body, apSsid);
+  body += ",\"password\":";
+  appendJsonEscaped(body, apPass);
+  body += ",\"ip\":";
+  appendJsonEscaped(body, apIp);
+  body += "}";
+  webServer.send(200, "application/json", body);
+}
+
+void handleApiNetworkSet() {
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  if (!webServer.hasArg("plain")) {
+    webServer.send(400, "application/json", "{\"error\":\"no body\"}");
+    return;
+  }
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, webServer.arg("plain")) != DeserializationError::Ok) {
+    webServer.send(400, "application/json", "{\"error\":\"json_parse\"}");
+    return;
+  }
+  const char* ssid = doc["ssid"] | "";
+  const char* password = doc["password"] | "";
+  size_t ssidLen = strlen(ssid);
+  size_t passLen = strlen(password);
+  if (ssidLen < 1 || ssidLen >= sizeof(apSsid)) {
+    webServer.send(400, "application/json", "{\"error\":\"invalid_ssid\"}");
+    return;
+  }
+  if (passLen > 0 && (passLen < 8 || passLen >= sizeof(apPass))) {
+    webServer.send(400, "application/json", "{\"error\":\"invalid_password\"}");
+    return;
+  }
+  strlcpy(apSsid, ssid, sizeof(apSsid));
+  strlcpy(apPass, password, sizeof(apPass));
+  saveSettings();
+  pendingWifiApply = true;
+  pendingWifiApplyAt = millis() + 900;
+  webServer.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Reseau sauvegarde\"}");
+}
+
+void handleApiOtaUpload() {
+  HTTPUpload& upload = webServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    otaUpdateOk = false;
+    otaUpdateError = "";
+    hubLogPrintf("@00 OTA_START file=%s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      otaUpdateError = "ota_begin_failed";
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (otaUpdateError.length() == 0) {
+      size_t written = Update.write(upload.buf, upload.currentSize);
+      if (written != upload.currentSize) {
+        otaUpdateError = "ota_write_failed";
+      }
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (otaUpdateError.length() == 0 && Update.end(true)) {
+      otaUpdateOk = true;
+      hubLogPrintf("@00 OTA_DONE size=%u\n", upload.totalSize);
+    } else {
+      if (otaUpdateError.length() == 0) otaUpdateError = "ota_end_failed";
+      hubLogPrintf("@00 OTA_FAIL %s\n", otaUpdateError.c_str());
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.end();
+    otaUpdateError = "ota_aborted";
+    hubLogPrintln("@00 OTA_ABORTED");
+  }
+}
+
+void handleApiOtaDone() {
+  webServer.sendHeader("Access-Control-Allow-Origin", "*");
+  webServer.sendHeader("Connection", "close");
+  if (!otaUpdateOk) {
+    String body = "{\"error\":";
+    appendJsonEscaped(body, otaUpdateError.length() ? otaUpdateError.c_str() : "ota_failed");
+    body += "}";
+    webServer.send(500, "application/json", body);
+    return;
+  }
+  pendingOtaReboot = true;
+  pendingOtaRebootAt = millis() + 900;
+  webServer.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Mise a jour installee. Redemarrage...\"}");
 }
 
 void handleApiProfiles() {
@@ -2767,6 +3331,30 @@ void startScan() {
   hubLogPrintln("@00 SCAN_START");
 }
 
+void startBootScan() {
+  for (int i = 0; i < nodeCount; i++) nodes[i].active = false;
+  selectedNode = -1;
+  listScroll = 0;
+  scanStart = millis();
+  lastDiscover = 0;
+  bootScanActive = true;
+  bootScanScheduled = false;
+  hubLogPrintln("@00 BOOT_SCAN_START");
+}
+
+void finishScan(bool bootScan) {
+  int found = activeNodeCount();
+  hubLogPrintf(bootScan ? "@00 BOOT_SCAN_END count=%d\n" : "@00 SCAN_END count=%d\n", found);
+  saveNodes();
+  if (bootScan) {
+    bootScanActive = false;
+    if (uiState != STATE_BOOT_LOGO) uiState = STATE_LIST;
+  } else {
+    uiState = STATE_LIST;
+  }
+  displayDirty = true;
+}
+
 // =====================================================
 // ESP-NOW callbacks
 // =====================================================
@@ -2807,6 +3395,10 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
       if (!isError && !nodes[idx].balReady) {
         nodes[idx].balReady = true;
         displayDirty = true;
+      }
+      if (!isError) {
+        strlcpy(nodes[idx].lastValue, m.payload, sizeof(nodes[idx].lastValue));
+        nodes[idx].lastValueTime = millis();
       }
       if (idx == selectedNode && !isError) {
         if (pendingTare[idx]) {
@@ -2863,18 +3455,42 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
       nodes[idx].active = true;
       char tmp[32];
       bool identityChanged = false;
-      if (extractQuotedField(m.payload, "bid", tmp, sizeof(tmp))) {
-        if (!extractClientBalanceId(tmp, nodes[idx].balanceId, sizeof(nodes[idx].balanceId))) {
-          strlcpy(nodes[idx].balanceId, tmp, sizeof(nodes[idx].balanceId));
+      bool bidFieldSeen = false;
+      bool bidHasClientId = false;
+      if (extractQuotedField(m.payload, "type", tmp, sizeof(tmp))) {
+        if (tmp[0] && strcmp(tmp, "?") != 0 && strcmp(tmp, nodes[idx].typeName) != 0) {
+          strlcpy(nodes[idx].typeName, tmp, sizeof(nodes[idx].typeName));
+          identityChanged = true;
         }
-        setNodeDisplayLabel(idx);
-        applyClientBrandMapping(idx);
+      }
+      if (extractQuotedField(m.payload, "sn", tmp, sizeof(tmp))) {
+        if (strcmp(tmp, "?") == 0) tmp[0] = 0;
+        if (strcmp(tmp, nodes[idx].balanceSerial) != 0) {
+          strlcpy(nodes[idx].balanceSerial, tmp, sizeof(nodes[idx].balanceSerial));
+          identityChanged = true;
+        }
+      }
+      if (extractQuotedField(m.payload, "bid", tmp, sizeof(tmp))) {
+        bidFieldSeen = true;
+        bool hasClientId = extractClientBalanceId(tmp, nodes[idx].balanceId, sizeof(nodes[idx].balanceId));
+        bidHasClientId = hasClientId;
+        if (!hasClientId) {
+          nodes[idx].balanceId[0] = 0;
+          nodes[idx].displayLabel[0] = 0;
+          if (strcmp(tmp, "?") != 0) {
+            strlcpy(nodes[idx].balanceIdRaw, tmp, sizeof(nodes[idx].balanceIdRaw));
+          }
+        } else {
+          strlcpy(nodes[idx].balanceIdRaw, tmp, sizeof(nodes[idx].balanceIdRaw));
+          setNodeDisplayLabel(idx);
+          applyClientBrandMapping(idx);
+        }
         identityChanged = true;
       }
       if (extractQuotedField(m.payload, "label", tmp, sizeof(tmp))) {
         char parsedId[20];
         bool parsedLabelId = extractClientBalanceId(tmp, parsedId, sizeof(parsedId));
-        if (parsedLabelId) {
+        if (parsedLabelId && (!bidFieldSeen || bidHasClientId)) {
           strlcpy(nodes[idx].balanceId, parsedId, sizeof(nodes[idx].balanceId));
           setNodeDisplayLabel(idx);
           applyClientBrandMapping(idx);
@@ -3295,6 +3911,27 @@ static void uiEvtCloseWifiQr(lv_event_t*) {
   displayDirty = true;
 }
 
+static void uiEvtWifiQrReset(lv_event_t* e) {
+  static unsigned long pressStart = 0;
+  static bool resetDone = false;
+  lv_event_code_t code = lv_event_get_code(e);
+  if (code == LV_EVENT_PRESSED) {
+    pressStart = millis();
+    resetDone = false;
+  } else if (code == LV_EVENT_PRESSING) {
+    if (!resetDone && pressStart && millis() - pressStart >= 5000) {
+      resetDone = true;
+      resetNetworkSettingsToDefault();
+      hubLogPrintf("@00 WIFI_RESET_DEFAULT ssid=%s\n", apSsid);
+      triggerButtonFeedback(3, 2);
+      pendingWifiApply = true;
+      pendingWifiApplyAt = millis() + 500;
+    }
+  } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+    pressStart = 0;
+  }
+}
+
 static void uiEvtZero(lv_event_t*) {
   if (selectedNode < 0 || selectedNode >= nodeCount) return;
   beep();
@@ -3549,7 +4186,22 @@ static const char* nodeConfiguredName(int idx) {
 
 static void buildWifiQrPayload(char* out, size_t outSize) {
   if (!out || outSize == 0) return;
-  snprintf(out, outSize, "WIFI:T:WPA;S:%s;P:%s;;", apSsid, AP_PASS);
+  char ssidEsc[80] = "";
+  char passEsc[96] = "";
+  auto escapeWifi = [](const char* src, char* dst, size_t dstSize) {
+    size_t n = 0;
+    if (!src || !dst || dstSize == 0) return;
+    for (size_t i = 0; src[i] && n + 1 < dstSize; i++) {
+      char c = src[i];
+      if ((c == '\\' || c == ';' || c == ',' || c == ':' || c == '"') && n + 2 < dstSize) dst[n++] = '\\';
+      dst[n++] = c;
+    }
+    dst[n] = 0;
+  };
+  escapeWifi(apSsid, ssidEsc, sizeof(ssidEsc));
+  escapeWifi(apPass, passEsc, sizeof(passEsc));
+  if (apPass[0]) snprintf(out, outSize, "WIFI:T:WPA;S:%s;P:%s;;", ssidEsc, passEsc);
+  else snprintf(out, outSize, "WIFI:T:nopass;S:%s;;", ssidEsc);
 }
 
 static bool addWifiQrCode(lv_obj_t* parent, const char* payload, int x, int y, int targetSize) {
@@ -3612,6 +4264,35 @@ static void addHeaderBackButton(lv_obj_t* scr, lv_event_cb_t cb) {
 
 static void addHeaderActionButton(lv_obj_t* scr, const char* icon, lv_event_cb_t cb, bool active = false, uint8_t feedbackIdx = 255, uint8_t hapticEffect = 1) {
   addIconButton(scr, 258, 50, 44, icon, cb, NULL, active, feedbackIdx, hapticEffect, LV_EVENT_CLICKED);
+}
+
+static uint8_t bootLogoFade(unsigned long elapsed, unsigned long start, unsigned long duration, uint8_t maxOpa = LV_OPA_COVER) {
+  if (elapsed <= start) return 0;
+  if (elapsed >= start + duration) return maxOpa;
+  return (uint8_t)(((elapsed - start) * maxOpa) / duration);
+}
+
+static void uiRenderBootLogo(lv_obj_t* scr) {
+  unsigned long elapsed = millis() - bootLogoStart;
+  uint8_t textOpa = bootLogoFade(elapsed, 250, 1100);
+  uint8_t labOpa = min((int)textOpa, (int)LV_OPA_COVER);
+  uint8_t conOpa = bootLogoFade(elapsed, 650, 1200);
+  float phase = (elapsed % 1500) / 1500.0f;
+  uint8_t glow = (uint8_t)(70 + 70 * (phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f));
+
+  lv_obj_t* lab = addText(scr, "Lab", 54, 150, &lv_font_montserrat_40, lv_color_hex(0x2C7FBE));
+  lv_obj_set_style_text_opa(lab, labOpa, 0);
+  lv_obj_set_style_shadow_width(lab, 10, 0);
+  lv_obj_set_style_shadow_opa(lab, labOpa / 5, 0);
+  lv_obj_set_style_shadow_color(lab, lv_color_hex(0x2C7FBE), 0);
+
+  lv_obj_t* connect = addText(scr, "Connect", 136, 150, &lv_font_montserrat_40, C_CYAN);
+  lv_obj_set_style_text_opa(connect, conOpa, 0);
+  lv_obj_set_style_shadow_width(connect, 16, 0);
+  lv_obj_set_style_shadow_opa(connect, elapsed > 1600 ? min(glow, conOpa) : conOpa / 4, 0);
+  lv_obj_set_style_shadow_color(connect, C_CYAN, 0);
+
+  if (elapsed < BOOT_LOGO_MS) displayDirty = true;
 }
 
 static void renderWeightFace(lv_obj_t* scr, bool compactCards) {
@@ -3688,7 +4369,11 @@ static void uiRenderWifiQr(lv_obj_t* scr) {
   lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(card, lv_color_hex(0xFFFFFF), 0);
   lv_obj_set_style_border_width(card, 0, 0);
-  lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(card, uiEvtWifiQrReset, LV_EVENT_PRESSED, NULL);
+  lv_obj_add_event_cb(card, uiEvtWifiQrReset, LV_EVENT_PRESSING, NULL);
+  lv_obj_add_event_cb(card, uiEvtWifiQrReset, LV_EVENT_RELEASED, NULL);
+  lv_obj_add_event_cb(card, uiEvtWifiQrReset, LV_EVENT_PRESS_LOST, NULL);
 
   char qrPayload[96];
   buildWifiQrPayload(qrPayload, sizeof(qrPayload));
@@ -3829,6 +4514,7 @@ void renderDisplay() {
   lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
   addBackdropTexture(scr);
   switch (uiState) {
+    case STATE_BOOT_LOGO: uiRenderBootLogo(scr);  break;
     case STATE_IDLE:      uiRenderIdle(scr);      break;
     case STATE_SCANNING:  uiRenderScanning(scr);  break;
     case STATE_LIST:      uiRenderList(scr);      break;
@@ -3849,6 +4535,8 @@ void handleEncoder() {
   static int32_t lastStep = 0;
   static bool lastSw = true;
   static unsigned long lastBtnAt = 0;
+
+  if (uiState == STATE_BOOT_LOGO) return;
 
   int32_t step = encRaw / 2;
   if (step != lastStep) {
@@ -3905,28 +4593,31 @@ void setup() {
   audioInit();
   lcd_lvgl_Init();
   lcd_bl_pwm_bsp_init(LCD_PWM_MODE_255);
+  bootLogoStart = millis();
+  uiState = STATE_BOOT_LOGO;
+  displayDirty = true;
 
-  uint32_t chip = (uint32_t)(ESP.getEfuseMac() >> 32);
-  snprintf(apSsid, sizeof(apSsid), "%s%04X", AP_SSID_PREFIX, chip & 0xFFFF);
+  loadSettings();
   WiFi.persistent(false);
-  WiFi.mode(WIFI_AP_STA);
+  WiFi.mode(WIFI_AP);
   WiFi.setAutoReconnect(false);
-  WiFi.softAP(apSsid, AP_PASS, AP_CHANNEL);
-  snprintf(apIp, sizeof(apIp), "%s", WiFi.softAPIP().toString().c_str());
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  applyWifiAp();
 
-  if (esp_now_init() != ESP_OK) {
+  bool espNowReady = esp_now_init() == ESP_OK;
+  if (!espNowReady) {
     hubLogPrintln("@00 ESPNOW_INIT_FAIL");
-    return;
+  } else {
+    esp_now_peer_info_t peer = {};
+    memset(peer.peer_addr, 0xFF, 6);
+    peer.channel = AP_CHANNEL;
+    peer.encrypt = false;
+    esp_now_add_peer(&peer);
+
+    esp_now_register_recv_cb(onRecv);
+    esp_now_register_send_cb(onSent);
   }
-
-  esp_now_peer_info_t peer = {};
-  memset(peer.peer_addr, 0xFF, 6);
-  peer.channel = 0;
-  peer.encrypt = false;
-  esp_now_add_peer(&peer);
-
-  esp_now_register_recv_cb(onRecv);
-  esp_now_register_send_cb(onSent);
 
   webServer.on("/", HTTP_GET, handleRoot);
   webServer.on("/favicon.ico", HTTP_GET, handleFavicon);
@@ -3954,17 +4645,22 @@ void setup() {
   webServer.on("/api/settings", HTTP_GET,     handleApiSettings);
   webServer.on("/api/settings", HTTP_POST,    handleApiSettingsSet);
   webServer.on("/api/settings", HTTP_OPTIONS, handleApiOptions);
+  webServer.on("/api/network", HTTP_GET,     handleApiNetwork);
+  webServer.on("/api/network", HTTP_POST,    handleApiNetworkSet);
+  webServer.on("/api/network", HTTP_OPTIONS, handleApiOptions);
+  webServer.on("/api/ota", HTTP_POST, handleApiOtaDone, handleApiOtaUpload);
+  webServer.on("/api/ota", HTTP_OPTIONS, handleApiOptions);
   webServer.onNotFound(handleNotFound);
   webServer.begin();
 
-  loadSettings();
   loadNodes();
   loadProfiles();
 
   hubLogPrintf("@00 HUB_READY ap=%s ip=%s\n", apSsid, apIp);
   if (nodeCount > 0) {
     hubLogPrintf("@00 LOADED nodes=%d\n", nodeCount);
-    startScan();
+    bootScanScheduled = true;
+    bootScanAt = bootLogoStart + BOOT_SCAN_DELAY_MS;
   }
   displayDirty = true;
 }
@@ -3973,6 +4669,40 @@ void loop() {
   handleTouch();
   handleEncoder();
   webServer.handleClient();
+
+  if (bootScanScheduled && millis() >= bootScanAt) {
+    startBootScan();
+  }
+
+  if (uiState == STATE_BOOT_LOGO) {
+    if (millis() - bootLogoStart >= BOOT_LOGO_MS) {
+      uiState = STATE_LIST;
+      displayDirty = true;
+    } else {
+      displayDirty = true;
+    }
+  }
+
+  if (pendingWifiApply && millis() >= pendingWifiApplyAt) {
+    pendingWifiApply = false;
+    hubLogPrintf("@00 WIFI_AP_APPLY ssid=%s\n", apSsid);
+    applyWifiAp();
+  }
+
+  if (millis() - lastWifiApCheckAt > 3000) {
+    lastWifiApCheckAt = millis();
+    IPAddress ip = WiFi.softAPIP();
+    if (ip[0] == 0) {
+      hubLogPrintln("@00 WIFI_AP_RECOVER");
+      applyWifiAp();
+    }
+  }
+
+  if (pendingOtaReboot && millis() >= pendingOtaRebootAt) {
+    hubLogPrintln("@00 OTA_REBOOT");
+    delay(50);
+    ESP.restart();
+  }
 
   if (pendingConfigPushIdx >= 0 && pendingConfigPushIdx < nodeCount) {
     int idx = pendingConfigPushIdx;
@@ -3991,17 +4721,15 @@ void loop() {
     pendingBeep = false;
   }
 
-  if (uiState == STATE_SCANNING) {
-    if (millis() - lastDiscover >= DISCOVER_INTERVAL_MS) {
+  if (uiState == STATE_SCANNING || bootScanActive) {
+    unsigned long discoverInterval = bootScanActive ? BOOT_DISCOVER_INTERVAL_MS : DISCOVER_INTERVAL_MS;
+    unsigned long scanDuration = bootScanActive ? BOOT_SCAN_DURATION_MS : SCAN_DURATION_MS;
+    if (millis() - lastDiscover >= discoverInterval) {
       lastDiscover = millis();
       sendDiscoverBroadcast();
     }
-    if (millis() - scanStart >= SCAN_DURATION_MS) {
-      int found = activeNodeCount();
-      hubLogPrintf("@00 SCAN_END count=%d\n", found);
-      saveNodes();
-      uiState = STATE_LIST;
-      displayDirty = true;
+    if (millis() - scanStart >= scanDuration) {
+      finishScan(bootScanActive);
     } else {
       displayDirty = true;
     }

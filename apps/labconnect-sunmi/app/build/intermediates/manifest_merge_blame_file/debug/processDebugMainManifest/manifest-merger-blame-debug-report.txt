@@ -1,0 +1,58 @@
+1<?xml version="1.0" encoding="utf-8"?>
+2<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+3    package="fr.bdp.labconnect.sunmi"
+4    android:versionCode="1"
+5    android:versionName="1.0.0" >
+6
+7    <uses-sdk
+8        android:minSdkVersion="23"
+9        android:targetSdkVersion="36" />
+10
+11    <uses-permission android:name="android.permission.INTERNET" />
+11-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:3:5-67
+11-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:3:22-64
+12    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+12-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:4:5-79
+12-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:4:22-76
+13    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+13-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:5:5-76
+13-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:5:22-73
+14
+15    <application
+15-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:7:5-23:19
+16        android:allowBackup="false"
+16-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:8:9-36
+17        android:debuggable="true"
+18        android:extractNativeLibs="false"
+19        android:icon="@drawable/ic_launcher"
+19-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:9:9-45
+20        android:label="LabConnect Hub"
+20-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:10:9-39
+21        android:networkSecurityConfig="@xml/network_security_config"
+21-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:11:9-69
+22        android:theme="@style/AppTheme"
+22-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:13:9-40
+23        android:usesCleartextTraffic="true" >
+23-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:12:9-44
+24        <activity
+24-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:14:9-22:20
+25            android:name="fr.bdp.labconnect.sunmi.MainActivity"
+25-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:15:13-41
+26            android:configChanges="keyboardHidden|orientation|screenSize"
+26-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:16:13-74
+27            android:exported="true" >
+27-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:17:13-36
+28            <intent-filter>
+28-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:18:13-21:29
+29                <action android:name="android.intent.action.MAIN" />
+29-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:19:17-69
+29-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:19:25-66
+30
+31                <category android:name="android.intent.category.LAUNCHER" />
+31-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:20:17-77
+31-->/Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/AndroidManifest.xml:20:27-74
+32            </intent-filter>
+33        </activity>
+34    </application>
+35
+36</manifest>

@@ -3,8 +3,6 @@
 #include "lcd_config.h"
 #include "cst816.h"
 static SemaphoreHandle_t lvgl_mux = NULL; //mutex semaphores
-static lv_obj_t *hello_label = NULL;
-static lv_obj_t *hello_hint = NULL;
 #define LCD_HOST    SPI2_HOST
 
 #define SH8601_ID 0x86
@@ -283,25 +281,13 @@ void lcd_lvgl_Init(void)
   lvgl_mux = xSemaphoreCreateMutex(); //mutex semaphores
   assert(lvgl_mux);
   xTaskCreate(example_lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL);
-  if (example_lvgl_lock(-1)) 
-  {   
+  if (example_lvgl_lock(-1))
+  {
     lv_obj_t *scr = lv_scr_act();
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_VER, 0);
-
-    hello_label = lv_label_create(scr);
-    lv_label_set_text(hello_label, "HELLO WORLD");
-    lv_obj_set_style_text_font(hello_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_letter_space(hello_label, 2, 0);
-    lv_obj_center(hello_label);
-
-    hello_hint = lv_label_create(scr);
-    lv_label_set_text(hello_hint, "Tourne le knob");
-    lv_obj_set_style_text_opa(hello_hint, LV_OPA_70, 0);
-    lv_obj_align(hello_hint, LV_ALIGN_CENTER, 0, 42);
-
-    lcd_set_knob_hue(200);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_grad_dir(scr, LV_GRAD_DIR_NONE, 0);
 
     // Release the mutex
     example_lvgl_unlock();
@@ -316,7 +302,6 @@ void lcd_set_knob_hue(uint16_t hue)
   if (example_lvgl_lock(20))
   {
     lv_obj_t *scr = lv_scr_act();
-    lv_color_t text = lv_color_hsv_to_rgb(hue, 95, 100);
     lv_color_t bg1 = lv_color_hsv_to_rgb((hue + 215) % 360, 70, 18);
     lv_color_t bg2 = lv_color_hsv_to_rgb((hue + 35) % 360, 80, 42);
 
@@ -324,9 +309,6 @@ void lcd_set_knob_hue(uint16_t hue)
     lv_obj_set_style_bg_grad_color(scr, bg2, 0);
     lv_obj_set_style_bg_main_stop(scr, 0, 0);
     lv_obj_set_style_bg_grad_stop(scr, 255, 0);
-
-    if (hello_label) lv_obj_set_style_text_color(hello_label, text, 0);
-    if (hello_hint) lv_obj_set_style_text_color(hello_hint, lv_color_hsv_to_rgb((hue + 180) % 360, 35, 92), 0);
 
     lv_obj_invalidate(scr);
     example_lvgl_unlock();

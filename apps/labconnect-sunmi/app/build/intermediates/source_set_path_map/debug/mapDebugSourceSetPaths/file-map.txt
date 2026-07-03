@@ -1,0 +1,7 @@
+fr.bdp.labconnect.sunmi.app-pngs-0 /Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/build/generated/res/pngs/debug
+fr.bdp.labconnect.sunmi.app-resValues-1 /Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/build/generated/res/resValues/debug
+fr.bdp.labconnect.sunmi.app-packageDebugResources-2 /Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/build/intermediates/incremental/debug/packageDebugResources/merged.dir
+fr.bdp.labconnect.sunmi.app-packageDebugResources-3 /Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/build/intermediates/incremental/debug/packageDebugResources/stripped.dir
+fr.bdp.labconnect.sunmi.app-debug-4 /Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/build/intermediates/merged_res/debug/mergeDebugResources
+fr.bdp.labconnect.sunmi.app-debug-5 /Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/debug/res
+fr.bdp.labconnect.sunmi.app-main-6 /Users/alexandreperou/Documents/labconnect/apps/labconnect-sunmi/app/src/main/res
