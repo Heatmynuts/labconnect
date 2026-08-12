@@ -3,7 +3,10 @@ param(
     [string]$Command = "SI",
     [int]$BaudRate = 9600,
     [int]$TimeoutMs = 1800,
-    [switch]$Identity
+    [switch]$Identity,
+    [switch]$Watch,
+    [int]$IntervalSeconds = 2,
+    [string]$StatusUrl = "http://192.168.4.1/api/status"
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,6 +50,27 @@ function Get-CdoFromResponse {
     return ""
 }
 
+function Get-LedState {
+    param(
+        [string]$Status,
+        [string]$Response
+    )
+
+    if ($Status -eq "OK") {
+        return "Vert bref, puis bleu fixe"
+    }
+
+    if ($Status -eq "Pas de reponse") {
+        return "Bleu fixe probable, sans reponse balance"
+    }
+
+    if ($Response -match "access.*denied|acces.*refuse|refuse|utilise|already.*open|denied") {
+        return "Deja ouvert par Optimu ou un autre logiciel"
+    }
+
+    return "Blanc clignotant, rouge clignotant, ou non couple"
+}
+
 function Read-PortResponse {
     param(
         [System.IO.Ports.SerialPort]$SerialPort,
@@ -72,6 +96,16 @@ function Read-PortResponse {
     }
 
     return ($chunks -join "")
+}
+
+function Get-AtomStatus {
+    param([string]$StatusUrl)
+
+    try {
+        return Invoke-RestMethod -Uri $StatusUrl -Method Get -TimeoutSec 1
+    } catch {
+        return $null
+    }
 }
 
 function Test-CdoPort {
@@ -118,6 +152,7 @@ function Test-CdoPort {
         [pscustomobject]@{
             Port = $PortName
             Statut = $status
+            "LED attendue" = Get-LedState -Status $status -Response $raw
             CDO = $cdo
             Balance = $balance
             Reponse = Convert-ControlChars -Text $raw
@@ -126,6 +161,7 @@ function Test-CdoPort {
         [pscustomobject]@{
             Port = $PortName
             Statut = "Erreur ouverture"
+            "LED attendue" = Get-LedState -Status "Erreur ouverture" -Response $_.Exception.Message
             CDO = ""
             Balance = ""
             Reponse = $_.Exception.Message
@@ -158,10 +194,39 @@ if ($Identity) {
 } else {
     Write-Host "Commande envoyee : $Command"
 }
+if ($Watch) {
+    Write-Host "Mode surveillance : Ctrl+C pour arreter"
+    Write-Host "Etat LED ATOM lu via : $StatusUrl si le Wi-Fi diagnostic est actif"
+}
 Write-Host ""
 
-$results = foreach ($port in $Ports) {
-    Test-CdoPort -PortName $port -Command $Command -BaudRate $BaudRate -TimeoutMs $TimeoutMs -Identity:$Identity
-}
+do {
+    $atomStatus = $null
+    if ($Watch) {
+        Clear-Host
+        Write-Host "LabConnect CDO - surveillance des ports COM"
+        Write-Host "Derniere mise a jour : $(Get-Date -Format 'HH:mm:ss')"
+        $atomStatus = Get-AtomStatus -StatusUrl $StatusUrl
+        if ($null -ne $atomStatus) {
+            Write-Host "ATOM diagnostic : $($atomStatus.id) $($atomStatus.model)"
+            Write-Host "LED ATOM       : $($atomStatus.led) - $($atomStatus.ledMeaning)"
+            Write-Host "Bluetooth      : $(if ($atomStatus.btClient) { 'PC connecte' } elseif ($atomStatus.btStarted) { 'pret, PC deconnecte' } else { 'non demarre' })"
+        } else {
+            Write-Host "ATOM diagnostic : indisponible. Active le diagnostic par triple clic et connecte le PC au Wi-Fi de l'ATOM."
+            Write-Host "LED attendue    : deduite ci-dessous depuis l'etat COM."
+        }
+        Write-Host ""
+    }
 
-$results | Format-Table -AutoSize
+    $results = foreach ($port in $Ports) {
+        Test-CdoPort -PortName $port -Command $Command -BaudRate $BaudRate -TimeoutMs $TimeoutMs -Identity:$Identity
+    }
+
+    $results | Format-Table -AutoSize
+
+    if ($Watch) {
+        Write-Host ""
+        Write-Host "Legende firmware : orange identification | rouge clignotant erreur | blanc clignotant PC deconnecte | bleu appairage/connecte | vert trafic"
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+} while ($Watch)

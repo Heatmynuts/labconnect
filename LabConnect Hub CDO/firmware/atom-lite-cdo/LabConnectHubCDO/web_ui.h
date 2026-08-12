@@ -29,7 +29,7 @@ const char LABCONNECT_CDO_WEB_UI[] PROGMEM = R"HTML(
     <div class="card"><div class="label">Bluetooth SPP</div><div class="value" id="bluetooth">En attente</div></div>
     <div class="card"><div class="label">RS-232</div><div class="value" id="uart">9600/8N1 · CRLF</div></div>
     <div class="card"><div class="label">Identification</div><div class="value" id="identification">Démarrage</div></div>
-    <div class="card"><div class="label">Wi-Fi diagnostic</div><div class="value" id="wifi">—</div></div>
+    <div class="card"><div class="label">LED ATOM</div><div class="value" id="led">—</div></div>
   </section>
   <section class="panel">
     <div class="toolbar"><strong>Journal des octets</strong><span class="sub">texte et hexadécimal</span><button id="clear">Effacer l’affichage</button></div>
@@ -41,7 +41,7 @@ const char LABCONNECT_CDO_WEB_UI[] PROGMEM = R"HTML(
 let after=0,rows=0;const box=document.querySelector('#events');
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function add(e){if(!rows)box.innerHTML='';const row=document.createElement('div');row.className='row';const label={'rx':'BAL → PC','tx':'PC → BAL','id-rx':'ID ← BAL','id-tx':'ID → BAL'}[e.dir]||e.dir;row.innerHTML=`<span class="time">${(e.ms/1000).toFixed(3)} s</span><span class="dir ${esc(e.dir)}">${esc(label)}</span><span class="text">${esc(e.text)}<span class="hex">${esc(e.hex)}</span></span>`;box.appendChild(row);rows++;while(box.children.length>160)box.firstChild.remove();box.scrollTop=box.scrollHeight;after=Math.max(after,e.seq)}
-async function poll(){try{const r=await fetch('/api/status?after='+after,{cache:'no-store'});if(!r.ok)throw Error(r.status);const s=await r.json();identity.textContent=s.id||'Détection…';model.textContent=s.model||'Balance non identifiée';bluetooth.textContent=s.btClient?'Optimu connecté':s.btStarted?'Prêt, PC déconnecté':'Non démarré';bluetooth.className='value '+(s.btClient?'ok':'');uart.textContent=s.uart;identification.textContent=s.identification;identification.className='value '+(s.id?'ok':s.identificationError?'bad':'');wifi.textContent=s.ssid;s.events.forEach(add)}catch(e){bluetooth.textContent='Diagnostic indisponible';bluetooth.className='value bad'}finally{setTimeout(poll,700)}}
+async function poll(){try{const r=await fetch('/api/status?after='+after,{cache:'no-store'});if(!r.ok)throw Error(r.status);const s=await r.json();identity.textContent=s.id||'Détection…';model.textContent=s.model||'Balance non identifiée';bluetooth.textContent=s.btClient?'Optimu connecté':s.btStarted?'Prêt, PC déconnecté':'Non démarré';bluetooth.className='value '+(s.btClient?'ok':'');uart.textContent=s.uart;identification.textContent=s.identification;identification.className='value '+(s.id?'ok':s.identificationError?'bad':'');led.textContent=(s.led||'—')+(s.ledMeaning?' · '+s.ledMeaning:'');led.className='value '+(s.identificationError?'bad':s.btClient?'ok':'');s.events.forEach(add)}catch(e){bluetooth.textContent='Diagnostic indisponible';bluetooth.className='value bad'}finally{setTimeout(poll,700)}}
 document.querySelector('#clear').onclick=()=>{box.innerHTML='<div class="empty">Affichage effacé</div>';rows=0};poll();
 </script>
 </body>

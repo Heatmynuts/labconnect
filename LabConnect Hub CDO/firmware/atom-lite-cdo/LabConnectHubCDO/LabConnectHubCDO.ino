@@ -138,6 +138,15 @@ uint32_t buttonChangedAt = 0;
 uint32_t buttonPressedAt = 0;
 uint32_t lastButtonClickAt = 0;
 
+enum class LedState : uint8_t {
+  Identifying,
+  ErrorBlinking,
+  ReadyBlinking,
+  PairingBlinking,
+  Connected,
+  Activity,
+};
+
 const char *manufacturerName(CdoManufacturer manufacturer) {
   return manufacturer == CdoManufacturer::Mettler ? "Mettler" : "A&D";
 }
@@ -160,6 +169,48 @@ void setLed(uint32_t color) {
       static_cast<uint8_t>(color >> 16),
       static_cast<uint8_t>(color >> 8),
       static_cast<uint8_t>(color));
+}
+
+LedState currentLedState(uint32_t now) {
+  if (bluetoothFault) return LedState::ErrorBlinking;
+  if (detectedBalance == nullptr) {
+    return identificationError ? LedState::ErrorBlinking
+                               : LedState::Identifying;
+  }
+  if (pairingMode) return LedState::PairingBlinking;
+  if (now - lastActivityAt < ACTIVITY_LED_MS) return LedState::Activity;
+  if (bluetoothStarted && SerialBT.hasClient()) return LedState::Connected;
+  return LedState::ReadyBlinking;
+}
+
+const char *ledStateName(LedState state) {
+  switch (state) {
+    case LedState::Identifying: return "orange fixe";
+    case LedState::ErrorBlinking: return "rouge clignotant";
+    case LedState::ReadyBlinking: return "blanc clignotant";
+    case LedState::PairingBlinking: return "bleu clignotant";
+    case LedState::Connected: return "bleu fixe";
+    case LedState::Activity: return "vert bref";
+  }
+  return "inconnu";
+}
+
+const char *ledStateMeaning(LedState state) {
+  switch (state) {
+    case LedState::Identifying:
+      return "identification de la balance";
+    case LedState::ErrorBlinking:
+      return "balance absente, identite invalide ou erreur Bluetooth";
+    case LedState::ReadyBlinking:
+      return "balance identifiee, Bluetooth pret, PC deconnecte";
+    case LedState::PairingBlinking:
+      return "appairage Bluetooth actif";
+    case LedState::Connected:
+      return "PC connecte en SPP";
+    case LedState::Activity:
+      return "donnees en transit";
+  }
+  return "";
 }
 
 void noteActivity() {
@@ -491,6 +542,11 @@ void handleStatus() {
   json += bluetoothStarted ? "true" : "false";
   json += ",\"btClient\":";
   json += (bluetoothStarted && SerialBT.hasClient()) ? "true" : "false";
+  const LedState ledState = currentLedState(millis());
+  json += ",\"led\":";
+  appendJsonString(json, ledStateName(ledState));
+  json += ",\"ledMeaning\":";
+  appendJsonString(json, ledStateMeaning(ledState));
   json += ",\"identification\":";
   appendJsonString(json, identificationStatus());
   json += ",\"identificationError\":";
@@ -651,19 +707,6 @@ void updateLed() {
   if (now - lastLedRefreshAt < LED_REFRESH_MS) return;
   lastLedRefreshAt = now;
 
-  if (bluetoothFault) {
-    setLed((now / 250) % 2 ? COLOR_ERROR : 0x000000);
-    return;
-  }
-  if (detectedBalance == nullptr) {
-    if (identificationError) {
-      setLed((now / 400) % 2 ? COLOR_ERROR : 0x000000);
-    } else {
-      setLed(COLOR_IDENTIFYING);
-    }
-    return;
-  }
-
   const bool connected = bluetoothStarted && SerialBT.hasClient();
   if (connected != previousClientState) {
     previousClientState = connected;
@@ -671,13 +714,25 @@ void updateLed() {
     if (connected) stopPairingMode();
   }
 
-  if (pairingMode) {
-    setLed((now / PAIRING_BLINK_MS) % 2 ? COLOR_PAIRING : 0x000000);
-  } else if (now - lastActivityAt < ACTIVITY_LED_MS) {
-    setLed(COLOR_ACTIVITY);
-  } else {
-    setLed(connected ? COLOR_CONNECTED
-                     : ((now / READY_BLINK_MS) % 2 ? COLOR_READY : 0x000000));
+  switch (currentLedState(now)) {
+    case LedState::Identifying:
+      setLed(COLOR_IDENTIFYING);
+      break;
+    case LedState::ErrorBlinking:
+      setLed((now / (bluetoothFault ? 250 : 400)) % 2 ? COLOR_ERROR : 0x000000);
+      break;
+    case LedState::ReadyBlinking:
+      setLed((now / READY_BLINK_MS) % 2 ? COLOR_READY : 0x000000);
+      break;
+    case LedState::PairingBlinking:
+      setLed((now / PAIRING_BLINK_MS) % 2 ? COLOR_PAIRING : 0x000000);
+      break;
+    case LedState::Connected:
+      setLed(COLOR_CONNECTED);
+      break;
+    case LedState::Activity:
+      setLed(COLOR_ACTIVITY);
+      break;
   }
 }
 

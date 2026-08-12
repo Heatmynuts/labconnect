@@ -137,6 +137,12 @@ une commande terminée par `CRLF`, puis affiche la réponse. Il sert à vérifie
 rapidement que Windows, l'ATOM, le lien Bluetooth et la balance répondent avant
 d'ouvrir Optimu.
 
+Il peut aussi fonctionner en mode surveillance. Dans ce mode, il rafraîchit
+l'affichage en continu. Si le diagnostic Wi-Fi de l'ATOM est actif et que le PC
+est connecté au réseau `CDOxx-Diag`, l'outil lit directement l'état LED publié
+par l'ATOM sur `http://192.168.4.1/api/status`. Sinon, il affiche un état LED
+probable déduit de l'état du port COM et de la réponse de la balance.
+
 Depuis PowerShell, dans le dossier du projet :
 
 ```powershell
@@ -154,6 +160,14 @@ powershell -ExecutionPolicy Bypass -File ".\LabConnect Hub CDO\tools\windows\Lab
 
 # Envoyer une autre commande de diagnostic.
 powershell -ExecutionPolicy Bypass -File ".\LabConnect Hub CDO\tools\windows\LabConnectCdoCheck.ps1" -Ports COM4 -Command I10
+
+# Surveiller en continu les ports utilisés par le client.
+powershell -ExecutionPolicy Bypass -File ".\LabConnect Hub CDO\tools\windows\LabConnectCdoCheck.ps1" -Ports COM2,COM3,COM4,COM5,COM6 -Watch
+
+# Surveiller avec lecture réelle de la LED ATOM.
+# Faire un triple clic sur l'ATOM, connecter Windows au Wi-Fi CDOxx-Diag,
+# puis lancer :
+powershell -ExecutionPolicy Bypass -File ".\LabConnect Hub CDO\tools\windows\LabConnectCdoCheck.ps1" -Ports COM4 -Watch -StatusUrl http://192.168.4.1/api/status
 ```
 
 Un port entrant Bluetooth peut apparaître dans Windows, mais il ne répond
