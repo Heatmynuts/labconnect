@@ -126,6 +126,40 @@ vive. Un nouveau triple clic coupe le Wi-Fi sans interrompre Optimu.
 Avant le déploiement complet, valider une A&D configurée en format MT avec le
 PC Optimu cible et comparer la réponse au branchement filaire.
 
+## Utilitaire Windows de contrôle
+
+Le dossier `tools/windows` contient un petit script PowerShell sans dépendance :
+
+`LabConnectCdoCheck.ps1`
+
+Il ouvre les ports COM disponibles en `9600/8N1`, sans contrôle de flux, envoie
+une commande terminée par `CRLF`, puis affiche la réponse. Il sert à vérifier
+rapidement que Windows, l'ATOM, le lien Bluetooth et la balance répondent avant
+d'ouvrir Optimu.
+
+Depuis PowerShell, dans le dossier du projet :
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ".\LabConnect Hub CDO\tools\windows\LabConnectCdoCheck.ps1"
+```
+
+Commandes utiles :
+
+```powershell
+# Tester seulement le port attendu pour CDO02.
+powershell -ExecutionPolicy Bypass -File ".\LabConnect Hub CDO\tools\windows\LabConnectCdoCheck.ps1" -Ports COM2
+
+# Tester l'identifiant de la balance, Mettler puis A&D.
+powershell -ExecutionPolicy Bypass -File ".\LabConnect Hub CDO\tools\windows\LabConnectCdoCheck.ps1" -Ports COM2,COM3,COM4,COM5,COM6 -Identity
+
+# Envoyer une autre commande de diagnostic.
+powershell -ExecutionPolicy Bypass -File ".\LabConnect Hub CDO\tools\windows\LabConnectCdoCheck.ps1" -Ports COM4 -Command I10
+```
+
+Un port entrant Bluetooth peut apparaître dans Windows, mais il ne répond
+normalement pas dans cette architecture. Optimu doit utiliser le port COM
+sortant.
+
 ## Remplacement d’un ATOM
 
 Flasher le firmware commun, connecter le nouvel ATOM à la balance et attendre
