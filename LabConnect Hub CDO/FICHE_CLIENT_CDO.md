@@ -1,51 +1,76 @@
-# LabConnect Hub CDO - Fiche terrain
+# LabConnect CDO — fiche terrain
 
-## Principe
+## Correspondance
 
-Chaque balance est reliee a un Atom Lite par RS232. L'Atom cree un port COM Bluetooth dans Windows. Optimu envoie `SI` sur ce port COM et recoit toujours une reponse compatible Mettler.
+| Balance | Identifiant Bluetooth | Port Optimu |
+|---|---|---|
+| A&D MC-30K | `CDO02` | COM2 |
+| A&D MC-6100 | `CDO03` | COM3 |
+| Mettler XP504 | `CDO04` | COM4 |
+| A&D BA-225 | `CDO05` | COM5 |
+| Mettler XP56 | `CDO06` | COM6 |
 
-## Commandes utiles
+Le numéro COM est attribué dans Windows. Toujours sélectionner le port
+Bluetooth **sortant**.
 
-| Commande | Effet |
-| --- | --- |
-| `SI` | Lire la pesee |
-| `T` | Tare |
-| `Z` | Zero |
-| `I10` | Lire l'identifiant CDO |
-| `LCINFO` | Diagnostic Atom |
+## Réglages des balances
 
-## Identification
+Toutes : `9600 / 8N1`, aucun contrôle de flux, terminaison `CRLF`.
 
-| Balance | Type | Bluetooth | Couleur LED repos | COM Windows |
-| --- | --- | --- | --- | --- |
-| CDO03 | A renseigner | CDO03 | Bleu | COM... |
-| CDO04 | A renseigner | CDO04 | Violet | COM... |
-| CDO05 | A renseigner | CDO05 | Vert | COM... |
-| CDO06 | A renseigner | CDO06 | Cyan | COM... |
+Les A&D doivent également être réglées sur le **format MT**. Chaque balance
+doit contenir son identifiant exact `CDO02` à `CDO06`.
 
-## Bouton Atom
+Pour les A&D, l’identifiant série est numérique : seuls les deux derniers
+chiffres sont retenus. `000003` et `0000003` deviennent donc `CDO03` ;
+`0000000` est refusé car aucune identité n’a été programmée.
 
-| Action | Effet |
-| --- | --- |
-| Clic court | Test local `SI` |
-| Appui long 3 s | Appairage Bluetooth pendant 120 s |
-| Triple clic | Redemarrage et re-identification de la balance |
+## Mise en service
 
-## LED
+1. Allumer la balance et connecter son ATOM.
+2. Attendre que le voyant cesse de clignoter en rouge.
+3. Maintenir le bouton 2,5 secondes : le voyant clignote en bleu.
+4. Associer `CDOxx` dans les réglages Bluetooth de Windows.
+5. Relever le port COM sortant dans le Gestionnaire de périphériques.
+6. Lui affecter le numéro du tableau, puis sélectionner ce port dans Optimu.
+7. Demander une mesure dans Optimu et comparer avec l’affichage de la balance.
 
-| Couleur | Signification |
-| --- | --- |
-| Violet au demarrage | Identification balance |
-| Bleu clignotant | Appairage Bluetooth actif |
-| Bleu sombre | PC connecte au port COM Bluetooth |
-| Vert bref | Activite commande/reponse |
-| Orange | Balance non identifiee ou test local en erreur |
+## Voyant
 
-## Test rapide Windows
+| État | Signification |
+|---|---|
+| Orange fixe | Recherche de l’identité de la balance |
+| Rouge clignotant | Balance absente, mal réglée ou identité invalide |
+| Blanc clignotant lent | Prêt, PC non connecté |
+| Bleu clignotant | Appairage actif pendant 120 secondes |
+| Bleu fixe | Optimu connecté |
+| Vert bref | Données échangées |
 
-1. Appui long sur l'Atom pour activer l'appairage.
-2. Appairer le Bluetooth `CDOxx` dans Windows.
-3. Relever le port COM cree par Windows.
-4. Ouvrir un terminal serie sur ce COM.
-5. Envoyer `SI`.
-6. La reponse doit ressembler a `S S +0.1234 g`.
+## Diagnostic
+
+Effectuer un triple clic, puis rejoindre le Wi-Fi `CDOxx-Diag` avec le mot de
+passe `labconnect`. Ouvrir `http://192.168.4.1/`.
+
+La page est uniquement un moniteur : elle ne peut ni commander la balance, ni
+changer ses réglages. Un nouveau triple clic coupe le Wi-Fi.
+
+## Si l’identité n’est pas trouvée
+
+Vérifier dans cet ordre :
+
+1. alimentation de la balance ;
+2. câble et adaptateur RS-232 M5Stack ;
+3. réglage `9600/8N1`, sans contrôle de flux, CRLF ;
+4. identifiant enregistré dans la balance ;
+5. diagnostic Wi-Fi ou console USB de l’ATOM.
+
+L’ATOM réessaie automatiquement et n’annonce aucun nom Bluetooth incorrect.
+
+## Remplacement
+
+Le firmware est identique pour les cinq ATOM. Après remplacement :
+
+1. connecter le nouvel ATOM à la balance ;
+2. attendre l’identification automatique ;
+3. supprimer l’ancien périphérique Bluetooth dans Windows ;
+4. associer le nouveau `CDOxx` ;
+5. réaffecter son ancien numéro COM.
